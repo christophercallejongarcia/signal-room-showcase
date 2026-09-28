@@ -1,0 +1,554 @@
+import { defineSchema, defineTable } from "convex/server";
+import { v } from "convex/values";
+
+/** Shape of one logged collection pass; shared with convex/runs.ts so the validator is declared once. */
+export const runFields = {
+  id: v.string(),
+  kind: v.union(v.literal("backfill"), v.literal("refresh"), v.literal("hashtag-sweep"), v.literal("transcript")),
+  status: v.union(v.literal("ok"), v.literal("partial"), v.literal("failed")),
+  startedAt: v.string(),
+  finishedAt: v.string(),
+  durationMs: v.number(),
+  creatorsChecked: v.number(),
+  creatorsSkipped: v.optional(v.number()),
+  recordsAdded: v.number(),
+  recordsUpdated: v.number(),
+  errors: v.array(v.object({ creatorId: v.string(), handle: v.string(), message: v.string() })),
+  usage: v.optional(
+    v.object({
+      unreported: v.number(),
+      computeUnits: v.optional(v.number()),
+      costUsd: v.optional(v.number()),
+    }),
+  ),
+  transcriptSignalId: v.optional(v.string()),
+  // failed is optional for Run rows written before the status-model change.
+  transcripts: v.optional(v.object({ added: v.number(), silent: v.number(), missing: v.number(), failed: v.optional(v.number()) })),
+  hashtagsChecked: v.optional(v.number()),
+  costLimitUsd: v.optional(v.number()),
+};
+
+/** Patch contract for a manual transcript flow. Null removes an optional Signal field. */
+export const transcriptPatchFields = {
+  transcript: v.optional(v.union(v.string(), v.null())),
+  transcriptSegments: v.optional(
+    v.union(v.array(v.object({ start: v.number(), end: v.number(), text: v.string() })), v.null()),
+  ),
+  transcriptAttempts: v.optional(v.number()),
+  transcriptUpdatedAt: v.optional(v.string()),
+  transcriptError: v.optional(v.union(v.string(), v.null())),
+  transcriptStatus: v.optional(
+    v.union(v.literal("ready"), v.literal("silent"), v.literal("missing"), v.literal("pending"), v.literal("failed"), v.null()),
+  ),
+  transcriptWorkingCopy: v.optional(v.union(v.string(), v.null())),
+  transcriptCorrections: v.optional(v.union(
+    v.array(v.object({
+      id: v.string(),
+      original: v.string(),
+      replacement: v.string(),
+      reason: v.string(),
+      source: v.union(v.literal("bridge"), v.literal("dictionary")),
+      status: v.union(v.literal("proposed"), v.literal("accepted"), v.literal("rejected")),
+      createdAt: v.string(),
+    })),
+    v.null(),
+  )),
+};
+
+/** One personal mapping reused when checking future transcripts. */
+export const transcriptDictionaryFields = {
+  wrong: v.string(),
+  right: v.string(),
+  createdAt: v.string(),
+};
+
+const transcriptAnalysisFeature = v.union(
+  v.literal("hook"),
+  v.literal("tension"),
+  v.literal("loop"),
+  v.literal("proof"),
+  v.literal("example"),
+  v.literal("transition"),
+  v.literal("rhythm"),
+  v.literal("cta"),
+);
+
+export const transcriptAnalysisFindingFields = {
+  feature: transcriptAnalysisFeature,
+  explanation: v.string(),
+  quote: v.string(),
+  start: v.number(),
+  end: v.number(),
+  timecode: v.optional(v.object({ start: v.number(), end: v.number() })),
+};
+
+const transcriptAnalysisFrameworkComponent = v.union(
+  v.literal("pas-problem"),
+  v.literal("pas-agitation"),
+  v.literal("pas-solution"),
+  v.literal("bbb-claim"),
+  v.literal("bbb-reason"),
+  v.literal("bbb-example"),
+);
+
+export const transcriptAnalysisFrameworkEvidenceFields = {
+  component: transcriptAnalysisFrameworkComponent,
+  explanation: v.string(),
+  quote: v.string(),
+  start: v.number(),
+  end: v.number(),
+  timecode: v.optional(v.object({ start: v.number(), end: v.number() })),
+};
+
+export const transcriptAnalysisChunkFields = {
+  index: v.number(),
+  start: v.number(),
+  end: v.number(),
+  status: v.union(v.literal("complete"), v.literal("missing")),
+};
+
+/** Persisted local-worker job and its human-reviewable, source-bound result. */
+export const transcriptAnalysisFields = {
+  id: v.string(),
+  signalId: v.string(),
+  textVersion: v.union(v.literal("original"), v.literal("working")),
+  textHash: v.string(),
+  analysisVersion: v.string(),
+  createdAt: v.string(),
+  runId: v.string(),
+  status: v.union(v.literal("queued"), v.literal("running"), v.literal("complete"), v.literal("failed")),
+  attempts: v.number(),
+  claimId: v.optional(v.string()),
+  claimedAt: v.optional(v.string()),
+  claimExpiresAt: v.optional(v.string()),
+  completedAt: v.optional(v.string()),
+  error: v.optional(v.string()),
+  framework: v.union(v.literal("pas"), v.literal("bbb"), v.literal("none")),
+  frameworkEvidence: v.optional(v.array(v.object(transcriptAnalysisFrameworkEvidenceFields))),
+  findings: v.array(v.object(transcriptAnalysisFindingFields)),
+  chunks: v.array(v.object(transcriptAnalysisChunkFields)),
+  textLength: v.number(),
+  complete: v.boolean(),
+};
+
+const patternScopeFields = {
+  market: v.union(v.literal("de"), v.literal("en")),
+  niche: v.union(v.literal("core"), v.literal("foreign")),
+  topic: v.string(),
+  ageBucket: v.union(v.literal("0-7"), v.literal("8-30"), v.literal("31-90")),
+  owned: v.boolean(),
+};
+export const patternFields = {
+  id: v.string(), name: v.string(), definition: v.string(), structure: v.array(v.string()),
+  status: v.union(v.literal("hypothesis"), v.literal("candidate"), v.literal("confirmed"), v.literal("rejected"), v.literal("merged")),
+  revision: v.number(), createdAt: v.string(), updatedAt: v.string(),
+};
+export const patternEvidenceFields = {
+  id: v.string(), patternId: v.string(), runId: v.string(), signalId: v.string(), analysisId: v.optional(v.string()),
+  verdict: v.union(v.literal("present"), v.literal("absent"), v.literal("unknown")), explanation: v.string(),
+  quote: v.optional(v.string()), start: v.optional(v.number()), end: v.optional(v.number()), evaluatedAt: v.string(), outlier: v.optional(v.number()),
+};
+export const patternRunFields = {
+  id: v.string(), patternId: v.string(), createdAt: v.string(), windowDays: v.literal(90), scope: v.object(patternScopeFields),
+  thresholds: v.object({ positiveReels: v.number(), positiveCreators: v.number(), negativeReels: v.number() }),
+  status: v.union(v.literal("candidate"), v.literal("insufficient"), v.literal("non-positive")),
+  positiveEvidenceIds: v.array(v.string()), negativeEvidenceIds: v.array(v.string()), unknownEvidenceIds: v.array(v.string()),
+  positiveCount: v.number(), negativeCount: v.number(), unknownCount: v.number(), positiveCreatorCount: v.number(),
+  positiveMedian: v.optional(v.number()), negativeMedian: v.optional(v.number()), medianDelta: v.optional(v.number()),
+  excluded: v.object({ duplicate: v.number(), market: v.number(), niche: v.number(), topic: v.number(), age: v.number(), owned: v.number(), incompleteAnalysis: v.number(), invalidOutlier: v.number() }),
+  caution: v.string(),
+};
+
+/** One German post collected from an Instagram hashtag search. */
+export const hashtagPostFields = {
+  id: v.string(),
+  externalId: v.string(),
+  hashtag: v.string(),
+  hashtags: v.array(v.string()),
+  ownerHandle: v.optional(v.string()),
+  title: v.string(),
+  caption: v.optional(v.string()),
+  publishedAt: v.string(),
+  plays: v.number(),
+  likes: v.number(),
+  comments: v.number(),
+  url: v.optional(v.string()),
+  topic: v.string(),
+  language: v.literal("de"),
+  collectedAt: v.string(),
+};
+
+/** Short-form plan attached to an idea; shared with convex/ideas.ts. */
+export const storyboardFields = {
+  scriptId: v.optional(v.string()),
+  scriptRevision: v.optional(v.number()),
+  hook: v.string(),
+  beats: v.array(v.object({ label: v.string(), detail: v.string() })),
+  cta: v.string(),
+  caption: v.string(),
+  takeaway: v.string(),
+  commentCta: v.optional(v.string()),
+  leadMagnetCta: v.optional(v.string()),
+};
+
+/** Forecast at an idea; range and potential are null without a comparable base. */
+export const forecastFields = {
+  range: v.union(v.object({ low: v.number(), high: v.number() }), v.null()),
+  potential: v.union(v.literal("low"), v.literal("medium"), v.literal("high"), v.null()),
+  comparableCount: v.number(),
+  risk: v.string(),
+  tension: v.string(),
+};
+
+/** One generated Cover-Lab package; image bytes stay in the local gitignored cache. */
+export const coverPackageFields = {
+  id: v.string(),
+  label: v.string(),
+  textOverlay: v.string(),
+  imageIdea: v.string(),
+  colorWorld: v.string(),
+  imagePrompt: v.string(),
+  imagePath: v.optional(v.string()),
+  imageUrl: v.optional(v.string()),
+  renderedAt: v.optional(v.string()),
+};
+
+/** One latest Cover-Lab board. Ideas keep at most one board per format. */
+export const coverBoardFields = {
+  format: v.union(v.literal("reel"), v.literal("youtube")),
+  aspectRatio: v.union(v.literal("4:5"), v.literal("16:9")),
+  treatment: v.union(v.literal("faceless"), v.literal("face")),
+  generatedAt: v.string(),
+  packages: v.array(v.object(coverPackageFields)),
+};
+
+/** One saved content approach. developRunId is set only while a develop run is in flight. */
+export const ideaFields = {
+  id: v.string(),
+  title: v.string(),
+  goal: v.optional(v.string()),
+  /** Six production stages in order plus dropped; the moves live in lib/ideas.ts. */
+  status: v.union(
+    v.literal("captured"),
+    v.literal("developing"),
+    v.literal("packaging"),
+    v.literal("scripting"),
+    v.literal("producing"),
+    v.literal("published"),
+    v.literal("dropped"),
+  ),
+  sourceSignalId: v.optional(v.string()),
+  sourceCreator: v.optional(v.string()),
+  sourceUrl: v.optional(v.string()),
+  storyboard: v.optional(v.object(storyboardFields)),
+  forecast: v.optional(v.object(forecastFields)),
+  /** Bounded by lib/cover-lab.ts to one current board per format. */
+  coverBoards: v.optional(v.array(v.object(coverBoardFields))),
+  developRunId: v.optional(v.string()),
+  developedAt: v.optional(v.string()),
+  evidenceCount: v.optional(v.number()),
+  createdAt: v.string(),
+  updatedAt: v.string(),
+};
+
+/** One evidence item attached to a Script Hook-Option. */
+const scriptHookEvidenceFields = {
+  signalId: v.string(),
+  hook: v.string(),
+  creator: v.string(),
+  outlier: v.number(),
+  fit: v.string(),
+};
+
+const scriptStatusValidator = v.union(v.literal("hook-selection"), v.literal("draft"), v.literal("review"), v.literal("approved"));
+const scriptFrameworkValidator = v.union(v.literal("pas"), v.literal("bbb"), v.literal("none"));
+
+/** One spoken direction shown before a Script draft exists. */
+const scriptHookOptionFields = {
+  id: v.string(),
+  hook: v.string(),
+  angle: v.string(),
+  hypothesis: v.string(),
+  framework: v.union(v.literal("pas"), v.literal("bbb"), v.literal("none")),
+  evidence: v.array(v.object(scriptHookEvidenceFields)),
+  edited: v.boolean(),
+};
+
+/** The ordered source-of-truth sections of a Script. */
+export const scriptSectionFields = {
+  kind: v.union(v.literal("hook"), v.literal("beat"), v.literal("transition"), v.literal("cta")),
+  label: v.string(),
+  text: v.string(),
+};
+
+/** A Script is its own production object, separate from its Idea and Storyboard. */
+export const scriptFields = {
+  id: v.string(),
+  ideaId: v.string(),
+  sourceSignalId: v.optional(v.string()),
+  evidenceSignalIds: v.array(v.string()),
+  status: scriptStatusValidator,
+  framework: scriptFrameworkValidator,
+  frameworkReason: v.string(),
+  hookOptions: v.array(v.object(scriptHookOptionFields)),
+  selectedHookId: v.optional(v.string()),
+  sections: v.array(v.object(scriptSectionFields)),
+  revision: v.number(),
+  approvedRevision: v.optional(v.number()),
+  approvedAt: v.optional(v.string()),
+  runId: v.optional(v.string()),
+  createdAt: v.string(),
+  updatedAt: v.string(),
+};
+
+/** The bounded fields accepted by the human Script editor. */
+export const scriptPatchFields = {
+  sections: v.optional(v.array(v.object(scriptSectionFields))),
+  framework: v.optional(scriptFrameworkValidator),
+  status: v.optional(scriptStatusValidator),
+  evidenceSignalIds: v.optional(v.array(v.string())),
+  hookOptions: v.optional(v.array(v.object(scriptHookOptionFields))),
+  selectedHookId: v.optional(v.union(v.string(), v.null())),
+};
+
+/** One Signal on a daily Briefing; part of briefingFields. */
+const briefingItemFields = {
+  signalId: v.string(),
+  creatorId: v.string(),
+  creatorName: v.string(),
+  creator: v.string(),
+  title: v.string(),
+  publishedAt: v.string(),
+  plays: v.number(),
+  outlier: v.number(),
+  velocity: v.number(),
+  score: v.number(),
+  caption: v.string(),
+  url: v.optional(v.string()),
+  coverUrl: v.optional(v.string()),
+  thumbnailSeed: v.string(),
+  topic: v.string(),
+  angle: v.optional(v.string()),
+};
+
+/** One daily Briefing; shared with convex/briefings.ts. One document per day. */
+export const briefingFields = {
+  id: v.string(),
+  generatedAt: v.string(),
+  day: v.string(),
+  windowStart: v.string(),
+  windowHours: v.number(),
+  sources: v.number(),
+  candidates: v.number(),
+  angles: v.boolean(),
+  items: v.array(v.object(briefingItemFields)),
+};
+
+/** One Startpunkt on a daily Slate; part of slateFields. */
+const slateStartFields = {
+  position: v.number(),
+  pitch: v.string(),
+  topic: v.string(),
+  sourceSignalId: v.string(),
+  sourceCreator: v.string(),
+  sourceTitle: v.string(),
+  sourceUrl: v.optional(v.string()),
+  outlier: v.number(),
+  plays: v.number(),
+  regeneratedAt: v.optional(v.string()),
+  ideaId: v.optional(v.string()),
+};
+
+/** One daily Slate; shared with convex/slates.ts. One document per day. */
+export const slateFields = {
+  id: v.string(),
+  generatedAt: v.string(),
+  updatedAt: v.string(),
+  day: v.string(),
+  windowStart: v.string(),
+  windowHours: v.number(),
+  sources: v.number(),
+  direction: v.optional(v.string()),
+  directionApplied: v.optional(v.string()),
+  starts: v.array(v.object(slateStartFields)),
+};
+
+/** One pattern's month over month move; part of formatReviewFields. */
+const reviewPatternFields = {
+  id: v.string(),
+  label: v.string(),
+  count: v.number(),
+  share: v.number(),
+  averageOutlier: v.number(),
+  previousCount: v.number(),
+  previousShare: v.number(),
+  previousAverageOutlier: v.number(),
+  countDelta: v.number(),
+  shareDelta: v.number(),
+  outlierDelta: v.number(),
+  move: v.union(v.literal("new"), v.literal("gone"), v.literal("up"), v.literal("down"), v.literal("flat")),
+};
+
+/** A small account whose outlier reel carries a named pattern; part of formatReviewFields. */
+const risingCreatorFields = {
+  creatorId: v.string(),
+  name: v.string(),
+  handle: v.string(),
+  audience: v.number(),
+  foreign: v.boolean(),
+  patternId: v.string(),
+  patternLabel: v.string(),
+  patternMove: reviewPatternFields.move,
+  signalId: v.string(),
+  title: v.string(),
+  outlier: v.number(),
+  publishedAt: v.string(),
+  url: v.optional(v.string()),
+};
+
+/** One monthly Format-Review; shared with convex/formatReviews.ts. */
+export const formatReviewFields = {
+  id: v.string(),
+  generatedAt: v.string(),
+  periodStart: v.string(),
+  periodEnd: v.string(),
+  windowDays: v.number(),
+  threshold: v.number(),
+  previousReviewId: v.optional(v.string()),
+  previousPeriodEnd: v.optional(v.string()),
+  total: v.number(),
+  previousTotal: v.number(),
+  patterns: v.array(v.object(reviewPatternFields)),
+  risingCreators: v.array(v.object(risingCreatorFields)),
+};
+
+/**
+ * One Hook variant with the outlier reels cited under it; part of hookRunFields.
+ * The five hypotheses are declared once in HOOK_HYPOTHESES (lib/hooks-board.ts);
+ * they are restated as literals here so the stored document validates strictly.
+ */
+const hookVariantFields = {
+  hook: v.string(),
+  hypothesis: v.union(
+    v.literal("curiosity"),
+    v.literal("list"),
+    v.literal("contrast"),
+    v.literal("promise"),
+    v.literal("story"),
+  ),
+  rationale: v.string(),
+  evidence: v.array(v.object({ hook: v.string(), creator: v.string(), outlier: v.number() })),
+};
+
+/** One logged Hooks-Board run; shared with convex/hookRuns.ts. Every start writes its own row. */
+export const hookRunFields = {
+  id: v.string(),
+  createdAt: v.string(),
+  sourceExcerpt: v.string(),
+  sourceLength: v.number(),
+  direction: v.optional(v.string()),
+  requested: v.number(),
+  kind: v.union(v.literal("transcript"), v.literal("one-liner")),
+  groups: v.array(
+    v.object({
+      hypothesis: hookVariantFields.hypothesis,
+      label: v.string(),
+      hint: v.string(),
+      variants: v.array(v.object(hookVariantFields)),
+    }),
+  ),
+  evidenceCount: v.number(),
+};
+
+export default defineSchema({
+  creators: defineTable({
+    id: v.string(),
+    name: v.string(),
+    handle: v.string(),
+    network: v.string(),
+    audience: v.number(),
+    accent: v.string(),
+    avatarUrl: v.optional(v.string()),
+    url: v.optional(v.string()),
+    owned: v.optional(v.boolean()),
+    foreign: v.optional(v.boolean()),
+    market: v.optional(v.union(v.literal("de"), v.literal("en"))),
+    lastCheckedAt: v.optional(v.string()),
+  }).index("by_external_id", ["id"]),
+  signals: defineTable({
+    id: v.string(),
+    externalId: v.optional(v.string()),
+    creatorId: v.string(),
+    title: v.string(),
+    publishedAt: v.string(),
+    views: v.number(),
+    plays: v.optional(v.number()),
+    likes: v.number(),
+    comments: v.number(),
+    durationSeconds: v.number(),
+    thumbnailSeed: v.string(),
+    thumbnailUrl: v.optional(v.string()),
+    url: v.optional(v.string()),
+    caption: v.optional(v.string()),
+    format: v.optional(v.string()),
+    topic: v.string(),
+    savedAt: v.optional(v.string()),
+    transcript: v.optional(v.string()),
+    transcriptSegments: v.optional(v.array(v.object({ start: v.number(), end: v.number(), text: v.string() }))),
+    transcriptWorkingCopy: v.optional(v.string()),
+    transcriptCorrections: v.optional(v.array(v.object({
+      id: v.string(),
+      original: v.string(),
+      replacement: v.string(),
+      reason: v.string(),
+      source: v.union(v.literal("bridge"), v.literal("dictionary")),
+      status: v.union(v.literal("proposed"), v.literal("accepted"), v.literal("rejected")),
+      createdAt: v.string(),
+    }))),
+    transcriptAttempts: v.optional(v.number()),
+    transcriptUpdatedAt: v.optional(v.string()),
+    transcriptError: v.optional(v.string()),
+    transcriptStatus: v.optional(
+      v.union(v.literal("ready"), v.literal("silent"), v.literal("missing"), v.literal("pending"), v.literal("failed")),
+    ),
+  })
+    .index("by_external_id", ["id"])
+    .index("by_creator", ["creatorId"])
+    .index("by_published", ["publishedAt"]),
+  transcriptDictionary: defineTable(transcriptDictionaryFields)
+    .index("by_wrong", ["wrong"])
+    .index("by_createdAt", ["createdAt"]),
+  transcriptAnalyses: defineTable(transcriptAnalysisFields)
+    .index("by_external_id", ["id"])
+    .index("by_signal_createdAt", ["signalId", "createdAt"])
+    .index("by_status_createdAt", ["status", "createdAt"])
+    .index("by_createdAt", ["createdAt"]),
+  patterns: defineTable(patternFields).index("by_external_id", ["id"]).index("by_updatedAt", ["updatedAt"]),
+  patternEvidence: defineTable(patternEvidenceFields).index("by_external_id", ["id"]).index("by_runId", ["runId"]),
+  patternComparisonRuns: defineTable(patternRunFields).index("by_external_id", ["id"]).index("by_createdAt", ["createdAt"]),
+  hashtagPosts: defineTable(hashtagPostFields)
+    .index("by_external_id", ["id"])
+    .index("by_published", ["publishedAt"]),
+  ideas: defineTable(ideaFields)
+    .index("by_external_id", ["id"])
+    .index("by_createdAt", ["createdAt"]),
+  scripts: defineTable(scriptFields)
+    .index("by_ideaId", ["ideaId"])
+    .index("by_external_id", ["id"])
+    .index("by_updatedAt", ["updatedAt"]),
+  hookRuns: defineTable(hookRunFields)
+    .index("by_external_id", ["id"])
+    .index("by_createdAt", ["createdAt"]),
+  briefings: defineTable(briefingFields)
+    .index("by_external_id", ["id"])
+    .index("by_day", ["day"]),
+  slates: defineTable(slateFields)
+    .index("by_external_id", ["id"])
+    .index("by_day", ["day"]),
+  formatReviews: defineTable(formatReviewFields)
+    .index("by_external_id", ["id"])
+    .index("by_periodEnd", ["periodEnd"]),
+  runs: defineTable(runFields)
+    .index("by_external_id", ["id"])
+    .index("by_startedAt", ["startedAt"]),
+});

@@ -1,0 +1,3096 @@
+"use client";
+
+import {
+  ArrowCounterClockwise,
+  ArrowRight,
+  ArrowUp,
+  ArrowDown,
+  ArrowsClockwise,
+  Binoculars,
+  BookmarkSimple,
+  ChartLineUp,
+  Globe,
+  CheckCircle,
+  Clock,
+  FileText,
+  House,
+  ImageSquare,
+  Lightbulb,
+  NewspaperClipping,
+  Plus,
+  Shapes,
+  Sparkle,
+  TextAa,
+  TrendUp,
+  UserCircle,
+  WarningCircle,
+  X,
+  ArrowSquareOut,
+  MagnifyingGlass,
+  Pulse,
+  Trash,
+  InstagramLogo,
+  YoutubeLogo,
+} from "@phosphor-icons/react";
+import { Fragment, FormEvent, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { CoverImage, formatNumber, formatOutlier, networkName, timeAgo } from "@/components/display";
+import { ReelDetailPanel, TranscriptStatusBadge } from "@/components/reel-detail";
+import { DiscoverFeed } from "@/components/discover-feed";
+import { TAB_PARAM, creatorPath, creatorStats } from "@/lib/creator-detail";
+import { rankCorpus, DEMO_NOW, type Ranked } from "@/lib/rank-corpus";
+import { demoCreators, demoHashtagPosts, demoScriptIdeaTitles, demoScripts, demoSignals } from "@/lib/demo-data";
+import { DEMO_SCORING_NOTE } from "@/lib/demo-score";
+import {
+  DEFAULT_OUTLIER_THRESHOLD,
+  OUTLIER_THRESHOLDS,
+  countOutliers,
+  countSaved,
+  filterDiscover,
+  sortDiscover,
+  isOutlier,
+  isOwned,
+  isSaved,
+  storeOrDemo,
+  withSavedAt,
+  withoutOwned,
+  type DiscoverView as DiscoverViewMode,
+  type DiscoverSort,
+  type OutlierThreshold,
+  type PublishedWindow,
+} from "@/lib/discover-filter";
+import { buildBriefing } from "@/lib/briefing";
+import {
+  BRIEFING_LIMIT,
+  BRIEFING_WINDOW_HOURS,
+  FORMAT_REVIEW_RISING_LIMIT,
+  FORMAT_REVIEW_SMALL_AUDIENCE,
+  FORMAT_WINDOW_DAYS,
+  HOOK_COUNTS,
+  HOOK_INPUT_MAX,
+  HOOK_RUN_HISTORY,
+  OUTLIER_THRESHOLD,
+  SLATE_DIRECTION_MAX,
+  SLATE_SIZE,
+  STRATEGY_BRIDGE_URL,
+  STRATEGY_EVIDENCE_LIMIT,
+  STRATEGY_EVIDENCE_WINDOW_DAYS,
+} from "@/lib/config";
+import { parseHookRequest, type HookRequestInput } from "@/lib/hooks-board";
+import { COVER_FORMATS, type CoverFormat, type CoverTreatment } from "@/lib/cover-lab";
+import { IDEA_STATUSES, canTransition, countByStage, nextStage, type IdeaInput } from "@/lib/ideas";
+import { SCRIPT_STATUSES, countByStatus } from "@/lib/scripts";
+import { isLegacyStoryboard, isStoryboardOutdated } from "@/lib/storyboard";
+import { nextRefreshAt, REFRESH_TIME_ZONE, REFRESH_ZONE_LABEL } from "@/lib/refresh-schedule";
+import { selectEvidence } from "@/lib/strategy-evidence";
+import { UNCLASSIFIED, buildFormatSignals, type FormatSignal } from "@/lib/format-signals";
+import { buildTrendRadar, type TrendRadar } from "@/lib/trend-radar";
+import { PatternComparisons, type PatternComparisonState } from "@/components/pattern-comparisons";
+import { demoPatternComparisons } from "@/lib/demo-patterns";
+
+import type { Briefing, CoverBoard, Forecast, FormatReview, FormatReviewPattern, HookRun, Idea, IdeaStatus, PatternMove, RefreshResult, Run, RunUsage, SavePatternComparison, Script, ScriptStatus, SignalRecord, Slate, TranscriptDictionaryEntry } from "@/lib/contracts";
+import type { MonthUsage } from "@/lib/run-cost";
+import type { Creator, Network, StrategyEvidenceItem } from "@/lib/contracts";
+
+/** Reachability plus Codex login, as reported by the bridge health route. */
+type BridgeHealth = "checking" | "online" | "offline" | "logged-out";
+
+/** The ideas repository as the Ideas tab sees it. */
+type IdeasState = {
+  items: Idea[];
+  phase: "loading" | "ready" | "error";
+  /** id of the idea whose develop run is in flight, null when none is. */
+  developing: string | null;
+  error: string;
+};
+
+type ScriptsState = {
+  items: Script[];
+  phase: "loading" | "ready" | "error";
+  error: string;
+};
+
+/** The Hooks board as its tab sees it. The runs are the history rail, newest first. */
+type HooksState = {
+  runs: HookRun[];
+  phase: "loading" | "ready" | "error";
+  /** Runs in flight. Two starts are two entries, so this counts instead of holding one id. */
+  running: number;
+  error: string;
+  /** id of the run on the board, null reads the newest one. */
+  selected: string | null;
+};
+
+/** The stored briefings as the Briefing tab sees them, newest first. */
+type BriefingState = {
+  briefings: Briefing[];
+  phase: "loading" | "ready" | "running" | "error";
+  /** id of the briefing on screen, null reads the newest one. */
+  selected: string | null;
+  error: string;
+};
+
+/** The stored slates as the Briefing tab sees them, newest first. */
+type SlateState = {
+  slates: Slate[];
+  phase: "loading" | "ready" | "running" | "error";
+  /** Position whose start is being written anew, null when none is. */
+  regenerating: number | null;
+  /** Position whose start is becoming an Idea, null when none is. */
+  capturing: number | null;
+  /** id of the slate on screen, null reads the newest one. */
+  selected: string | null;
+  error: string;
+};
+
+/** The monthly Format-Review as the Format Signals tab sees it. */
+type ReviewState = {
+  review: FormatReview | null;
+  phase: "loading" | "ready" | "running" | "error";
+};
+
+/** The stored Instagram hashtag sweep as the Trend Radar tab sees it. */
+type TrendState = {
+  radar: TrendRadar | null;
+  phase: "loading" | "ready" | "running" | "error";
+  error: string;
+};
+
+/** The strategy panel's own state. These four always travel together. */
+type CoverRun = { ideaId: string; format: CoverFormat; treatment: CoverTreatment; packageId?: string };
+type CoverState = { phase: "idle" | "loading" | "error"; run: CoverRun | null; error: string };
+
+const navItems = [
+  { id: "discover", label: "Discover", icon: House },
+  { id: "briefing", label: "Briefing", icon: NewspaperClipping },
+  { id: "radar", label: "Trend Radar", icon: TrendUp },
+  { id: "formats", label: "Format Signals", icon: Shapes },
+  { id: "channels", label: "Tracked Channels", icon: Binoculars },
+  { id: "ideas", label: "Ideas", icon: Lightbulb },
+  { id: "scripts", label: "Scripts", icon: FileText },
+  { id: "thumbnails", label: "Cover Lab", icon: ImageSquare },
+  { id: "hooks", label: "Hooks", icon: TextAa },
+  { id: "profile", label: "Profile", icon: UserCircle },
+] as const;
+
+type TabId = (typeof navItems)[number]["id"];
+
+function NetworkLabel({ network }: { network: Network }) {
+  return <span className="network-label">{networkName(network)}</span>;
+}
+
+const HOURS_48 = 48 * 60 * 60 * 1000;
+
+function formatThreshold(value: number) {
+  return `${value}x`;
+}
+
+function isNew(publishedAt: string, now: number) {
+  return now - new Date(publishedAt).getTime() < HOURS_48;
+}
+
+function formatDuration(ms: number) {
+  if (ms < 1000) return `${ms} ms`;
+  const seconds = Math.round(ms / 1000);
+  return seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
+}
+
+/**
+ * Age inside a briefing window, measured against the moment the briefing was
+ * composed rather than the reader's clock, so an old document keeps reading right.
+ */
+function ageInWindow(publishedAt: string, generatedAt: string) {
+  const hours = Math.max(0, (new Date(generatedAt).getTime() - new Date(publishedAt).getTime()) / 3_600_000);
+  if (hours < 1) return "just now";
+  return `${Math.round(hours)}h old`;
+}
+
+/** Dollars with cents; the tenth of a cent shows because a single delta run costs about that. */
+function formatUsd(usd: number) {
+  return usd < 0.1 ? `$${usd.toFixed(3)}` : `$${usd.toFixed(2)}`;
+}
+
+/**
+ * One run's Apify cost for the log. No usage (logged before the guard) or no
+ * figure from any actor run reads unknown; a partly reported run shows its
+ * known part with a plus, never a number that pretends to be complete.
+ */
+function formatRunCost(usage: RunUsage | undefined) {
+  if (!usage || usage.costUsd === undefined) return { label: "unknown", title: "Apify reported no usage for this run" };
+  const units = usage.computeUnits === undefined ? "" : `${usage.computeUnits.toFixed(3)} CU`;
+  if (usage.unreported > 0) {
+    return { label: `${formatUsd(usage.costUsd)}+`, title: `${units || "usage"} reported; ${usage.unreported} actor runs without a figure` };
+  }
+  return { label: formatUsd(usage.costUsd), title: units || "Apify total" };
+}
+
+function formatTranscriptCounts(run: Run) {
+  if (!run.transcripts) return "—";
+  const { added, silent, missing, failed = 0 } = run.transcripts;
+  return `+${added} / S${silent} / M${missing} / F${failed}`;
+}
+
+function formatStamp(iso: string) {
+  return new Date(iso).toLocaleString(undefined, { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+
+function SignalMedia({ signal, index, threshold }: { signal: Ranked; index: number; threshold: number }) {
+  const now = Date.now();
+  const reel = signal.format === "reel";
+  const outlier = signal.outlier ?? 0;
+  return (
+    <div className={reel ? "signal-media reel" : "signal-media"}>
+      <CoverImage signal={signal} index={index} lazy />
+      <div className="badge-row">
+        <span>{isOutlier(signal, threshold) && <span className="badge outlier">{outlier.toFixed(1)}x</span>}</span>
+        {isNew(signal.publishedAt, now) && <span className="badge lime">NEW</span>}
+      </div>
+      {reel && (
+        <div className="badge-bottom">
+          <span className="badge format">Short form</span>
+          <TranscriptStatusBadge signal={signal} compact />
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function SignalRoom() {
+  const [activeTab, setActiveTab] = useState<TabId>("discover");
+  const [network, setNetwork] = useState<Network>("instagram");
+  const [creators, setCreators] = useState<Creator[]>(demoCreators);
+  const [signals, setSignals] = useState<SignalRecord[]>(demoSignals);
+  const [transcriptDictionary, setTranscriptDictionary] = useState<TranscriptDictionaryEntry[]>([]);
+  const [live, setLive] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [lastRefresh, setLastRefresh] = useState("Demo snapshot");
+  const [runs, setRuns] = useState<Run[]>([]);
+  const [runsMonth, setRunsMonth] = useState<MonthUsage | null>(null);
+  const [runsState, setRunsState] = useState<"loading" | "ready" | "error">("loading");
+  const [addState, setAddState] = useState<"idle" | "loading" | "error">("idle");
+  const [threshold, setThreshold] = useState<OutlierThreshold>(DEFAULT_OUTLIER_THRESHOLD);
+
+  async function loadStore() {
+    const response = await fetch("/api/signals");
+    if (!response.ok) return;
+    const data = (await response.json()) as { creators: Creator[]; signals: SignalRecord[]; dictionary?: TranscriptDictionaryEntry[] };
+    // One real creator hides every demo fixture. Demo only exists for an empty store.
+    const store = storeOrDemo(data, { creators: demoCreators, signals: demoSignals });
+    const isLive = store === data;
+    setCreators(store.creators);
+    setSignals(store.signals);
+    setLive(isLive);
+    setLastRefresh(isLive ? "Stored snapshot" : "Demo snapshot");
+    if (isLive) setTranscriptDictionary(data.dictionary ?? []);
+  }
+
+  async function loadRuns() {
+    try {
+      const response = await fetch("/api/runs");
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { runs: Run[]; month?: MonthUsage };
+      setRuns(data.runs);
+      setRunsMonth(data.month ?? null);
+      setRunsState("ready");
+    } catch {
+      setRunsState("error");
+    }
+  }
+
+  async function loadIdeas() {
+    try {
+      const response = await fetch("/api/ideas", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { ideas: Idea[] };
+      setIdeas((current) => ({ ...current, items: data.ideas, phase: "ready" }));
+    } catch {
+      setIdeas((current) => ({ ...current, phase: "error" }));
+    }
+  }
+
+  async function loadScripts() {
+    try {
+      const response = await fetch("/api/scripts", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { scripts: Script[]; demo?: boolean };
+      setScripts((current) => ({ ...current, items: data.demo ? demoScripts : data.scripts, phase: "ready" }));
+    } catch {
+      setScripts((current) => ({ ...current, phase: "error" }));
+    }
+  }
+
+  async function loadHookRuns() {
+    try {
+      const response = await fetch("/api/hooks", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { runs: HookRun[] };
+      setHooks((current) => ({ ...current, runs: data.runs, phase: "ready" }));
+    } catch {
+      setHooks((current) => ({ ...current, phase: "error" }));
+    }
+  }
+
+  async function loadBriefings() {
+    try {
+      const response = await fetch("/api/briefings", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { briefings: Briefing[] };
+      setBriefings((current) => ({ ...current, briefings: data.briefings, phase: "ready" }));
+    } catch {
+      setBriefings((current) => ({ ...current, phase: "error" }));
+    }
+  }
+
+  /** The manual pass. Every Delta-Refresh runs the same composition on its own. */
+  async function composeBriefingNow() {
+    setBriefings((current) => ({ ...current, phase: "running", error: "" }));
+    try {
+      const response = await fetch("/api/briefings", { method: "POST" });
+      const payload = (await response.json().catch(() => ({}))) as { briefing?: Briefing; error?: string };
+      if (!response.ok || !payload.briefing) {
+        throw new Error(payload.error || `The briefing answered with HTTP ${response.status}.`);
+      }
+      const briefing = payload.briefing;
+      setBriefings((current) => ({
+        briefings: [briefing, ...current.briefings.filter((item) => item.id !== briefing.id)],
+        phase: "ready",
+        selected: briefing.id,
+        error: "",
+      }));
+    } catch (error) {
+      setBriefings((current) => ({
+        ...current,
+        phase: "ready",
+        error: error instanceof Error ? error.message : "The briefing could not be composed.",
+      }));
+    }
+  }
+
+  async function loadSlates() {
+    try {
+      const response = await fetch("/api/slates", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { slates: Slate[] };
+      setSlates((current) => ({ ...current, slates: data.slates, phase: "ready" }));
+    } catch {
+      setSlates((current) => ({ ...current, phase: "error" }));
+    }
+  }
+
+  /** Puts one slate in place of the one with its id, newest first, and shows it. */
+  function placeSlate(slate: Slate, patch: Partial<SlateState> = {}) {
+    setSlates((current) => ({
+      ...current,
+      slates: [slate, ...current.slates.filter((item) => item.id !== slate.id)].sort((a, b) => b.day.localeCompare(a.day)),
+      selected: slate.id,
+      error: "",
+      ...patch,
+    }));
+  }
+
+  /** Reads the slate answer of a route, or throws its reason. */
+  async function slateAnswer(response: Response, failure: string) {
+    const payload = (await response.json().catch(() => ({}))) as { slate?: Slate; idea?: Idea; error?: string };
+    if (!response.ok || !payload.slate) throw new Error(payload.error || `${failure} (HTTP ${response.status}).`);
+    return payload as { slate: Slate; idea?: Idea };
+  }
+
+  /** The manual pass. Every local Delta-Refresh runs the same one; force rebuilds the day's slate. */
+  async function composeSlate(force: boolean) {
+    setSlates((current) => ({ ...current, phase: "running", error: "" }));
+    try {
+      const response = await fetch("/api/slates", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ force }),
+      });
+      const { slate } = await slateAnswer(response, "The slate could not be composed");
+      placeSlate(slate, { phase: "ready" });
+    } catch (error) {
+      setSlates((current) => ({ ...current, phase: "ready", error: error instanceof Error ? error.message : "The slate could not be composed." }));
+    }
+  }
+
+  /** One position anew; the other starts stay as they are. */
+  async function regenerateSlateStart(id: string, position: number) {
+    if (slates.regenerating !== null) return;
+    setSlates((current) => ({ ...current, regenerating: position, error: "" }));
+    try {
+      const response = await fetch("/api/slates/regenerate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id, position }),
+      });
+      const { slate } = await slateAnswer(response, "The start could not be regenerated");
+      placeSlate(slate, { regenerating: null });
+    } catch (error) {
+      setSlates((current) => ({ ...current, regenerating: null, error: error instanceof Error ? error.message : "The start could not be regenerated." }));
+    }
+  }
+
+  /** Stores the direction for the next run on the slate. */
+  async function saveSlateDirection(id: string, direction: string) {
+    setSlates((current) => ({ ...current, error: "" }));
+    try {
+      const response = await fetch("/api/slates", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id, direction }),
+      });
+      const { slate } = await slateAnswer(response, "The direction could not be saved");
+      placeSlate(slate);
+    } catch (error) {
+      setSlates((current) => ({ ...current, error: error instanceof Error ? error.message : "The direction could not be saved." }));
+    }
+  }
+
+  /** The click: one start becomes an Idea with its source reel; the row says so and the Ideas tab has it. */
+  async function captureSlateStart(id: string, position: number) {
+    if (slates.capturing !== null) return;
+    setSlates((current) => ({ ...current, capturing: position, error: "" }));
+    try {
+      const response = await fetch("/api/slates/ideas", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id, position }),
+      });
+      const { slate, idea } = await slateAnswer(response, "The idea could not be captured");
+      placeSlate(slate, { capturing: null });
+      if (idea) setIdeas((current) => ({ ...current, items: [idea, ...current.items.filter((item) => item.id !== idea.id)], phase: "ready" }));
+    } catch (error) {
+      setSlates((current) => ({ ...current, capturing: null, error: error instanceof Error ? error.message : "The idea could not be captured." }));
+    }
+  }
+
+  async function loadFormatReview() {
+    try {
+      const response = await fetch("/api/format-reviews", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { review: FormatReview | null };
+      setReview({ review: data.review, phase: "ready" });
+    } catch {
+      setReview((current) => ({ ...current, phase: "error" }));
+    }
+  }
+
+  async function loadPatternComparisons() {
+    try {
+      const response = await fetch("/api/patterns", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { comparisons: SavePatternComparison[] };
+      setPatternComparisons({ items: data.comparisons, phase: "ready", error: "" });
+    } catch {
+      setPatternComparisons((current) => ({ ...current, phase: "error", error: "Pattern-Vergleiche konnten nicht geladen werden." }));
+    }
+  }
+
+  async function runPatternDiscovery(sourceSignalIds: string[], scope: { market: "de" | "en"; niche: "core" | "foreign"; topic: string; ageBucket: "0-7" | "8-30" | "31-90"; owned: boolean }) {
+    setPatternComparisons((current) => ({ ...current, phase: "running", error: "" }));
+    try {
+      const response = await fetch("/api/patterns", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sourceSignalIds, ...scope }) });
+      const payload = (await response.json().catch(() => ({}))) as SavePatternComparison & { error?: string };
+      if (!response.ok || !payload.run) throw new Error(payload.error || `HTTP ${response.status}`);
+      setPatternComparisons((current) => ({ items: [payload, ...current.items.filter((item) => item.run.id !== payload.run.id)], phase: "ready", error: "" }));
+    } catch (error) {
+      setPatternComparisons((current) => ({ ...current, phase: "ready", error: error instanceof Error ? error.message : "Pattern-Lauf fehlgeschlagen." }));
+    }
+  }
+
+  async function loadTrendRadar() {
+    try {
+      const response = await fetch("/api/trends", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { radar: TrendRadar };
+      setTrend({ radar: data.radar, phase: "ready", error: "" });
+    } catch {
+      setTrend((current) => ({ ...current, phase: "error", error: "Trend Radar could not be loaded." }));
+    }
+  }
+
+  async function runTrendSweep() {
+    setTrend((current) => ({ ...current, phase: "running", error: "" }));
+    try {
+      const response = await fetch("/api/trends", { method: "POST" });
+      const payload = (await response.json().catch(() => ({}))) as { radar?: TrendRadar; error?: string };
+      if (!response.ok || !payload.radar) throw new Error(payload.error || `The hashtag sweep answered with HTTP ${response.status}.`);
+      setTrend({ radar: payload.radar, phase: "ready", error: "" });
+      await loadRuns();
+    } catch (error) {
+      setTrend((current) => ({ ...current, phase: "ready", error: error instanceof Error ? error.message : "The hashtag sweep failed." }));
+    }
+  }
+
+  /** The manual pass. The Convex cron runs the same computation on the first of the month. */
+  async function runFormatReview() {
+    setReview((current) => ({ ...current, phase: "running" }));
+    try {
+      const response = await fetch("/api/format-reviews", { method: "POST" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = (await response.json()) as { review: FormatReview };
+      setReview({ review: data.review, phase: "ready" });
+    } catch {
+      setReview((current) => ({ ...current, phase: "error" }));
+    }
+  }
+
+  async function checkBridge() {
+    setBridge("checking");
+    try {
+      const response = await fetch(`${STRATEGY_BRIDGE_URL}/health`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const health = (await response.json()) as { codex?: string };
+      setBridge(health.codex === "logged-out" ? "logged-out" : "online");
+    } catch {
+      setBridge("offline");
+    }
+  }
+
+  // The detail page links back with ?tab=channels, so the return lands on the list it came from.
+  useEffect(() => {
+    const wanted = new URLSearchParams(window.location.search).get(TAB_PARAM);
+    if (navItems.some((item) => item.id === wanted)) setActiveTab(wanted as TabId);
+  }, []);
+
+  useEffect(() => {
+    loadStore().catch(() => {});
+    loadRuns();
+    loadIdeas();
+    loadScripts();
+    loadHookRuns();
+    loadBriefings();
+    loadSlates();
+    loadFormatReview();
+    loadPatternComparisons();
+    loadTrendRadar();
+    checkBridge();
+  }, []);
+  const [showAddCreator, setShowAddCreator] = useState(false);
+  const [bridge, setBridge] = useState<BridgeHealth>("checking");
+  const [ideas, setIdeas] = useState<IdeasState>({ items: [], phase: "loading", developing: null, error: "" });
+  const [scripts, setScripts] = useState<ScriptsState>({ items: [], phase: "loading", error: "" });
+  const [briefings, setBriefings] = useState<BriefingState>({
+    briefings: [],
+    phase: "loading",
+    selected: null,
+    error: "",
+  });
+  const [slates, setSlates] = useState<SlateState>({
+    slates: [],
+    phase: "loading",
+    regenerating: null,
+    capturing: null,
+    selected: null,
+    error: "",
+  });
+  const [review, setReview] = useState<ReviewState>({ review: null, phase: "loading" });
+  const [patternComparisons, setPatternComparisons] = useState<PatternComparisonState>({ items: [], phase: "loading", error: "" });
+  const [trend, setTrend] = useState<TrendState>({ radar: null, phase: "loading", error: "" });
+  const [hooks, setHooks] = useState<HooksState>({ runs: [], phase: "loading", running: 0, error: "", selected: null });
+  const [covers, setCovers] = useState<CoverState>({ phase: "idle", run: null, error: "" });
+  const [selectedReel, setSelectedReel] = useState<{ signal: Ranked; creator: Creator } | null>(null);
+
+  const rankedSignals = useMemo(() => rankCorpus(signals, creators, live), [creators, signals, live]);
+
+  function openReel(signalId: string) {
+    const signal = rankedSignals.find((item) => item.id === signalId);
+    const creator = signal ? creators.find((item) => item.id === signal.creatorId) : undefined;
+    if (signal && creator) setSelectedReel({ signal, creator });
+  }
+
+  function updateSignal(updated: SignalRecord) {
+    setSignals((current) => current.map((signal) => (signal.id === updated.id ? { ...signal, ...updated } : signal)));
+    setSelectedReel((current) => current && current.signal.id === updated.id
+      ? { ...current, signal: { ...current.signal, ...updated } }
+      : current);
+  }
+
+  function updateTranscriptDictionary(entries: TranscriptDictionaryEntry[]) {
+    setTranscriptDictionary(entries);
+  }
+
+  const demoRadar = useMemo(
+    () => buildTrendRadar(
+      { posts: demoHashtagPosts, signals: demoSignals, creators: demoCreators },
+      { now: DEMO_NOW.getTime() },
+    ),
+    [],
+  );
+
+  /** Evidence is the stored corpus only. Demo fixtures never reach the Strategy-Provider. */
+  const evidence = useMemo(
+    () => (live ? selectEvidence(rankedSignals, creators, { now: Date.now() }) : []),
+    [live, rankedSignals, creators],
+  );
+
+  const activeNav = navItems.find((item) => item.id === activeTab) ?? navItems[0];
+  const ActiveIcon = activeNav.icon;
+
+  async function refreshDemo() {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      const response = await fetch("/api/refresh", { method: "POST" });
+      if (response.ok) {
+        const result = (await response.json()) as RefreshResult;
+        await Promise.all([loadStore(), loadRuns(), loadBriefings(), loadSlates(), loadTrendRadar()]);
+        const failed = result.errors?.length ?? 0;
+        const left = result.creatorsSkipped ?? 0;
+        if (failed === 0 && left === 0) setLastRefresh("Refreshed just now");
+        else if (failed === 0) setLastRefresh(`Refreshed ${result.creatorsChecked} creators, ${left} left for the next run`);
+        else if (failed >= result.creatorsChecked) setLastRefresh("Refresh failed");
+        else setLastRefresh(`Refreshed with ${failed} of ${result.creatorsChecked} creators failing`);
+      } else {
+        setLastRefresh("Refresh failed");
+        await loadRuns();
+      }
+    } catch {
+      setLastRefresh("Refresh failed");
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
+  async function addCreator(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const handle = String(form.get("handle") || "").trim().replace(/^@/, "");
+    const network = String(form.get("network") || "youtube") as Network;
+    const owned = form.get("owned") === "on";
+    const market = form.get("market") === "en" ? "en" : "de";
+    if (!handle) return;
+
+    if (network === "instagram") {
+      setAddState("loading");
+      try {
+        const response = await fetch("/api/creators", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ handle, network, owned, market }),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        await loadStore();
+        setAddState("idle");
+        setShowAddCreator(false);
+      } catch {
+        setAddState("error");
+      }
+      return;
+    }
+
+    setCreators((current) => [
+      ...current,
+      {
+        id: `creator-${handle.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+        name: handle
+          .split(/[._-]/)
+          .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+          .join(" "),
+        handle: `@${handle}`,
+        network,
+        audience: 0,
+        accent: "#ff6546",
+        ...(owned ? { owned: true } : {}),
+      },
+    ]);
+    setShowAddCreator(false);
+  }
+
+  /** One creator mark. Optimistic, and rolled back to the creator we started from when the route says no. */
+  async function markCreator(creator: Creator, mark: { owned?: boolean; foreign?: boolean }) {
+    setCreators((current) => current.map((item) => (item.id === creator.id ? { ...item, ...mark } : item)));
+    try {
+      const response = await fetch("/api/creators", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: creator.id, ...mark }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    } catch {
+      // Only the marks we sent roll back; anything else that moved meanwhile stays.
+      const before = Object.fromEntries(Object.keys(mark).map((key) => [key, creator[key as keyof Creator]]));
+      setCreators((current) => current.map((item) => (item.id === creator.id ? { ...item, ...before } : item)));
+    }
+  }
+
+  /** Flips the foreign-niche mark that splits the Format Signals tab. */
+  const toggleForeign = (creator: Creator) => markCreator(creator, { foreign: !creator.foreign });
+
+  /** Flips the owned mark: an owned creator leaves the research views and reads in Profile. */
+  const toggleOwned = (creator: Creator) => markCreator(creator, { owned: !isOwned(creator) });
+
+  /**
+   * Move an idea by hand. The server refuses a forbidden move with the reason,
+   * and that reason lands in the error box instead of a silent no-op.
+   */
+  async function moveIdea(ideaId: string, status: IdeaStatus) {
+    setIdeas((current) => ({ ...current, error: "" }));
+    try {
+      const response = await fetch("/api/ideas", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: ideaId, status }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as { idea?: Idea; error?: string };
+      if (!response.ok || !payload.idea) throw new Error(payload.error || `The ideas table answered with HTTP ${response.status}.`);
+      const moved = payload.idea;
+      setIdeas((current) => ({ ...current, items: current.items.map((item) => (item.id === ideaId ? moved : item)) }));
+    } catch (error) {
+      setIdeas((current) => ({ ...current, error: error instanceof Error ? error.message : "The move failed." }));
+    }
+  }
+
+  /** Capture from the Ideas form or from a card. Both land in the same ideas table. */
+  async function captureIdea(input: IdeaInput) {
+    const title = input.title.trim();
+    if (!title) return;
+    setIdeas((current) => ({ ...current, error: "" }));
+    try {
+      const response = await fetch("/api/ideas", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...input, title }),
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(payload.error || `The ideas table answered with HTTP ${response.status}.`);
+      }
+      const { idea } = (await response.json()) as { idea: Idea };
+      setIdeas((current) => ({ ...current, items: [idea, ...current.items], phase: "ready" }));
+      setActiveTab("ideas");
+    } catch (error) {
+      setIdeas((current) => ({ ...current, error: error instanceof Error ? error.message : "The capture failed." }));
+    }
+  }
+
+  /**
+   * Save or release one signal. The mark is written to the store, so it survives a
+   * restart; the demo fixtures have no store, so there it only lives in this tab.
+   */
+  async function toggleSaved(signal: SignalRecord) {
+    const saved = !isSaved(signal);
+    const apply = (next: SignalRecord) =>
+      setSignals((current) => current.map((item) => (item.id === next.id ? next : item)));
+    // Optimistic, like markCreator: the card flips at once and rolls back when the store refuses.
+    apply(withSavedAt(signal, saved ? new Date().toISOString() : null));
+    if (!live) return;
+    try {
+      const response = await fetch("/api/signals", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: signal.id, saved }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const { signal: stored } = (await response.json()) as { signal: SignalRecord };
+      apply(stored);
+    } catch {
+      apply(signal);
+      setLastRefresh(saved ? "Saving the reel failed" : "Releasing the reel failed");
+    }
+  }
+
+  /** Develop through the server route, then open the Script Hook Selection page. */
+  async function developIdea(ideaId: string) {
+    if (ideas.developing) return;
+    setIdeas((current) => ({ ...current, developing: ideaId, error: "" }));
+    try {
+      const response = await fetch("/api/ideas/develop", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ideaId }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as { idea?: Idea; script?: Script; openedExisting?: boolean; stale?: boolean; error?: string };
+      if (!response.ok) {
+        if (response.status >= 500) checkBridge();
+        throw new Error(payload.error || `The develop run answered with HTTP ${response.status}.`);
+      }
+      if (payload.stale) {
+        await Promise.all([loadIdeas(), loadScripts()]);
+        return;
+      }
+      setIdeas((current) => ({
+        ...current,
+        items: current.items.map((item) => (item.id === ideaId ? payload.idea ?? item : item)),
+      }));
+      if (payload.script) {
+        setScripts((current) => ({
+          ...current,
+          items: [payload.script as Script, ...current.items.filter((item) => item.id !== payload.script?.id)],
+          phase: "ready",
+        }));
+        window.location.assign(`/script/${encodeURIComponent(payload.script.id)}?from=ideas`);
+      }
+    } catch (error) {
+      setIdeas((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : "The develop run failed.",
+      }));
+    } finally {
+      setIdeas((current) => ({ ...current, developing: null }));
+    }
+  }
+
+  /** Creates a format-specific board or replaces one package while the other format stays attached. */
+  async function renderCovers(input: CoverRun) {
+    if (covers.run) return;
+    setCovers({ phase: "loading", run: input, error: "" });
+    try {
+      const response = await fetch(input.packageId ? "/api/covers/regenerate" : "/api/covers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+      });
+      const payload = (await response.json().catch(() => ({}))) as { idea?: Idea; error?: string };
+      if (!response.ok || !payload.idea) throw new Error(payload.error || `The cover run answered with HTTP ${response.status}.`);
+      setIdeas((current) => ({
+        ...current,
+        items: current.items.map((idea) => (idea.id === payload.idea?.id ? payload.idea : idea)),
+      }));
+      setCovers({ phase: "idle", run: null, error: "" });
+    } catch (error) {
+      setCovers({ phase: "error", run: null, error: error instanceof Error ? error.message : "The cover run failed." });
+      checkBridge();
+    }
+  }
+
+  /**
+   * One Hooks-Board run. Each start posts on its own and lands as its own entry,
+   * so two runs kicked off in parallel both keep their board.
+   */
+  async function generateHooks(input: { source: string; direction: string; count: number }) {
+    let request: HookRequestInput;
+    try {
+      // The same validation the route runs, so an oversized paste is refused before it travels.
+      request = parseHookRequest(input);
+    } catch (error) {
+      setHooks((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : "The input was refused.",
+      }));
+      return;
+    }
+    if (!live) {
+      setHooks((current) => ({
+        ...current,
+        error: "The corpus is empty, the cards show demo fixtures. Add a creator to the watchlist first.",
+      }));
+      return;
+    }
+
+    setHooks((current) => ({ ...current, running: current.running + 1, error: "" }));
+    try {
+      const response = await fetch("/api/hooks", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      const payload = (await response.json().catch(() => ({}))) as { run?: HookRun; error?: string };
+      if (!response.ok || !payload.run) {
+        throw new Error(payload.error || `The hooks run answered with HTTP ${response.status}.`);
+      }
+      const run = payload.run;
+      setHooks((current) => ({
+        ...current,
+        runs: [run, ...current.runs.filter((item) => item.id !== run.id)].slice(0, HOOK_RUN_HISTORY),
+        selected: run.id,
+        phase: "ready",
+      }));
+    } catch (error) {
+      setHooks((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : "The hooks run failed.",
+      }));
+      checkBridge();
+    } finally {
+      setHooks((current) => ({ ...current, running: Math.max(0, current.running - 1) }));
+    }
+  }
+
+  // The Discover counters read the same corpus its cards do: own uploads are not in it.
+  const research = withoutOwned(rankedSignals, creators);
+  const knownVideos = research.length;
+  const nowMs = Date.now();
+  const newIn48 = research.filter((signal) => isNew(signal.publishedAt, nowMs)).length;
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <button className="brand" onClick={() => setActiveTab("discover")} aria-label="Open Discover">
+          <span className="brand-mark"><Pulse size={26} weight="bold" /></span>
+          <span>
+            <strong>Signal Room</strong>
+            <small>Intelligence desk</small>
+          </span>
+        </button>
+
+        <nav className="primary-nav" aria-label="Primary navigation">
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.id}
+                className={activeTab === item.id ? "nav-item active" : "nav-item"}
+                onClick={() => setActiveTab(item.id)}
+              >
+                <Icon size={15} weight={activeTab === item.id ? "fill" : "regular"} />
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="topbar-actions">
+          <button className="icon-button" onClick={refreshDemo} disabled={refreshing} aria-label="Refresh">
+            <ArrowsClockwise className={refreshing ? "spin" : ""} size={17} />
+          </button>
+          <button className="icon-button" onClick={() => setActiveTab("profile")} aria-label="Open profile">
+            <UserCircle size={20} />
+          </button>
+        </div>
+      </header>
+
+      <main>
+        {activeTab === "discover" && (
+          <DiscoverView
+            rankedSignals={rankedSignals}
+            creators={creators}
+            network={network}
+            onNetwork={setNetwork}
+            lastRefresh={lastRefresh}
+            stats={{ knownVideos, newIn48 }}
+            threshold={threshold}
+            onThreshold={setThreshold}
+            onCreateIdea={captureIdea}
+            onToggleSaved={toggleSaved}
+            onOpenReel={openReel}
+          />
+        )}
+        {activeTab === "briefing" && (
+          <BriefingView
+            state={briefings}
+            signals={signals}
+            creators={creators}
+            live={live}
+            onCompose={composeBriefingNow}
+            onSelect={(id) => setBriefings((current) => ({ ...current, selected: id }))}
+            onCreateIdea={captureIdea}
+            rankedSignals={rankedSignals}
+            onOpenReel={openReel}
+            slate={{
+              state: slates,
+              onCompose: composeSlate,
+              onSelect: (id) => setSlates((current) => ({ ...current, selected: id })),
+              onRegenerate: regenerateSlateStart,
+              onDirection: saveSlateDirection,
+              onCapture: captureSlateStart,
+            }}
+          />
+        )}
+        {activeTab === "radar" && <RadarView state={trend} demo={demoRadar} live={live} onSweep={runTrendSweep} />}
+        {activeTab === "formats" && (
+          <FormatsView
+            rankedSignals={rankedSignals}
+            creators={creators}
+            threshold={threshold}
+            review={review}
+            onRunReview={runFormatReview}
+            patternComparisons={patternComparisons}
+            signals={signals}
+            live={live}
+            onDiscoverPattern={runPatternDiscovery}
+            onOpenReel={openReel}
+          />
+        )}
+        {activeTab === "channels" && (
+          <ChannelsView
+            creators={creators}
+            rankedSignals={rankedSignals}
+            network={network}
+            onNetwork={setNetwork}
+            onAdd={() => setShowAddCreator(true)}
+            onToggleForeign={toggleForeign}
+            onToggleOwned={toggleOwned}
+            issues={runs[0]?.errors.length ?? 0}
+            lastRun={runs[0] ?? null}
+          />
+        )}
+        {activeTab === "ideas" && (
+          <IdeasView
+            bridge={bridge}
+            ideas={ideas}
+            onCapture={captureIdea}
+            onDevelop={developIdea}
+            onMove={moveIdea}
+            onReloadIdeas={loadIdeas}
+            scripts={scripts.items}
+          />
+        )}
+        {activeTab === "scripts" && (
+          <ScriptsView state={scripts} signals={signals} ideas={ideas.items} onReload={loadScripts} />
+        )}
+        {activeTab === "thumbnails" && (
+          <ThumbnailsView
+            ideas={ideas.items}
+            bridge={bridge}
+            covers={covers}
+            onGenerate={renderCovers}
+            onRecheckBridge={checkBridge}
+          />
+        )}
+        {activeTab === "hooks" && (
+          <HooksView
+            hooks={hooks}
+            live={live}
+            bridge={bridge}
+            evidence={evidence}
+            onGenerate={generateHooks}
+            onRecheckBridge={checkBridge}
+            onSelect={(id) => setHooks((current) => ({ ...current, selected: id }))}
+            onReload={loadHookRuns}
+          />
+        )}
+        {activeTab === "profile" && <ProfileView creators={creators} rankedSignals={rankedSignals} runs={runs} runsMonth={runsMonth} runsState={runsState} />}
+      </main>
+
+      {showAddCreator && <AddCreatorDialog onClose={() => setShowAddCreator(false)} onSubmit={addCreator} state={addState} />}
+      {selectedReel && (
+        <ReelDetailPanel
+          signal={selectedReel.signal}
+          creator={selectedReel.creator}
+          onClose={() => setSelectedReel(null)}
+          onSignalUpdated={updateSignal}
+          onRunCreated={() => void loadRuns()}
+          dictionary={transcriptDictionary}
+          onDictionaryUpdated={updateTranscriptDictionary}
+          demo={!live}
+        />
+      )}
+    </div>
+  );
+}
+
+function NetworkToggle({ network, onNetwork }: { network: Network; onNetwork: (network: Network) => void }) {
+  return (
+    <div className="pill-group" role="tablist" aria-label="Network">
+      <button className={network === "youtube" ? "active" : ""} onClick={() => onNetwork("youtube")}>
+        <YoutubeLogo size={14} weight="fill" /> YouTube
+      </button>
+      <button className={network === "instagram" ? "active" : ""} onClick={() => onNetwork("instagram")}>
+        <InstagramLogo size={14} /> IG
+      </button>
+    </div>
+  );
+}
+
+const DISCOVER_SORTS = {
+  date: { asc: "oldest", desc: "newest" },
+  outlier: { asc: "outlier-asc", desc: "outlier" },
+  views: { asc: "views-asc", desc: "views" },
+} satisfies Record<string, Record<"asc" | "desc", DiscoverSort>>;
+
+function DiscoverView({
+  rankedSignals,
+  creators,
+  network,
+  onNetwork,
+  lastRefresh,
+  stats,
+  threshold,
+  onThreshold,
+  onCreateIdea,
+  onToggleSaved,
+  onOpenReel,
+}: {
+  rankedSignals: Ranked[];
+  creators: Creator[];
+  network: Network;
+  onNetwork: (network: Network) => void;
+  lastRefresh: string;
+  stats: { knownVideos: number; newIn48: number };
+  threshold: OutlierThreshold;
+  onThreshold: (threshold: OutlierThreshold) => void;
+  onCreateIdea: (input: IdeaInput) => void;
+  onToggleSaved: (signal: SignalRecord) => void;
+  onOpenReel: (signalId: string) => void;
+}) {
+  const [view, setView] = useState<DiscoverViewMode>("all");
+  const [published, setPublished] = useState<PublishedWindow>("90");
+  const [channel, setChannel] = useState("all");
+  const [sortBy, setSortBy] = useState<keyof typeof DISCOVER_SORTS>("date");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
+  const sort = DISCOVER_SORTS[sortBy][sortDirection];
+  const [perPage, setPerPage] = useState(24);
+  const [cols, setCols] = useState(4);
+
+  const creatorMap = new Map(creators.map((creator) => [creator.id, creator]));
+  // Every count and picker on this tab reads the same corpus the cards do: no owned creator in it.
+  const researchCreators = creators.filter((creator) => !isOwned(creator));
+  const researchSignals = withoutOwned(rankedSignals, creators);
+  const networkCreators = researchCreators.filter((creator) => creator.network === network);
+  const nowMs = Date.now();
+
+  const filters = { network, creatorId: channel, published, now: nowMs, threshold };
+  // Counter and outlier view share one predicate, so the stat block always equals the card count.
+  const outliers = countOutliers(rankedSignals, creators, filters);
+  // Same for the saved view: the stat block and the matches counter read the predicate the cards use.
+  const saved = countSaved(rankedSignals, creators, filters);
+  const filtered = sortDiscover(filterDiscover(rankedSignals, creators, { ...filters, view }), sort);
+  const feedKey = JSON.stringify([network, view, published, channel, sort, threshold, perPage]);
+  const isIg = network === "instagram";
+
+  return (
+    <div className="view-stack">
+      <div className="desk-toolbar">
+        <NetworkToggle network={network} onNetwork={onNetwork} />
+        <div className="toolbar-facts">
+          <span><strong>{stats.knownVideos}</strong> videos</span>
+          <span><strong>{researchCreators.length}</strong> channels</span>
+          <span><strong>{researchSignals.filter((s) => s.coverUrl).length}</strong> visual reads</span>
+          <span>{lastRefresh}</span>
+        </div>
+      </div>
+
+      <section className="hero">
+        <div>
+          <p className="hero-kicker">Tracked {isIg ? "Instagram" : "AI"} channels / updated daily</p>
+          <h1>{isIg ? "Instagram content feed" : "Competitor video feed"}</h1>
+          <p className="hero-sub">
+            Every tracked upload lives in one place, newest first. Switch to Outliers when you want performance analysis instead of a chronological feed.
+          </p>
+        </div>
+        <div className="stat-blocks">
+          <div><strong>{stats.knownVideos}</strong><span>known videos</span></div>
+          <div><strong>{stats.newIn48}</strong><span>new in 48h</span></div>
+          <div className="lime"><strong>{outliers}</strong><span>{formatThreshold(threshold)}+ outliers</span></div>
+          <div><strong>{saved}</strong><span>saved</span></div>
+        </div>
+      </section>
+
+      <section className="filter-bar" aria-label="Filters">
+        <div>
+          <span className="filter-label">View</span>
+          <div className="view-toggle">
+            <button className={view === "all" ? "active" : ""} onClick={() => setView("all")}>All videos</button>
+            <button className={view === "outliers" ? "active" : ""} onClick={() => setView("outliers")}>Outliers</button>
+            <button className={view === "saved" ? "active" : ""} onClick={() => setView("saved")}>Saved</button>
+          </div>
+          <p className="filter-hint">
+            {view === "outliers" ? "Above the selected audience multiplier" : view === "saved" ? "Only what you saved" : "Every matching upload"}
+          </p>
+        </div>
+        <div>
+          <label htmlFor="f-published">Published</label>
+          <select id="f-published" value={published} onChange={(e) => setPublished(e.target.value as PublishedWindow)}>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="all">All time</option>
+          </select>
+        </div>
+        <div>
+          <label htmlFor="f-channel">Channel</label>
+          <select id="f-channel" value={channel} onChange={(e) => setChannel(e.target.value)}>
+            <option value="all">All tracked channels</option>
+            {networkCreators.map((creator) => (
+              <option key={creator.id} value={creator.id}>{creator.name}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label htmlFor="f-threshold">Outlier threshold</label>
+          <select id="f-threshold" value={threshold} onChange={(e) => onThreshold(Number(e.target.value) as OutlierThreshold)}>
+            {OUTLIER_THRESHOLDS.map((value) => (
+              <option key={value} value={value}>{formatThreshold(value)} audience</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label htmlFor="f-perpage">Videos per load</label>
+          <select id="f-perpage" value={perPage} onChange={(e) => setPerPage(Number(e.target.value))}>
+            <option value={12}>12 videos</option>
+            <option value={24}>24 videos</option>
+            <option value={48}>48 videos</option>
+          </select>
+        </div>
+        <div className="filter-matches">
+          <strong>{filtered.length}</strong>
+          <span>matches</span>
+        </div>
+      </section>
+
+      <section className="discover-sort" aria-label="Sortierung">
+        <div className="discover-sort-field">
+          <label htmlFor="f-sort">Sortieren nach</label>
+          <select id="f-sort" value={sortBy} onChange={(e) => setSortBy(e.target.value as typeof sortBy)}>
+            <option value="date">Datum</option>
+            <option value="outlier">Multiplikator</option>
+            <option value="views">{isIg ? "Plays" : "Views"}</option>
+          </select>
+        </div>
+        <div className="view-toggle" role="group" aria-label="Sortierrichtung">
+          <button type="button" className={sortDirection === "asc" ? "active" : ""} aria-pressed={sortDirection === "asc"} onClick={() => setSortDirection("asc")}>
+            <ArrowUp size={16} aria-hidden="true" /> Aufsteigend
+          </button>
+          <button type="button" className={sortDirection === "desc" ? "active" : ""} aria-pressed={sortDirection === "desc"} onClick={() => setSortDirection("desc")}>
+            <ArrowDown size={16} aria-hidden="true" /> Absteigend
+          </button>
+        </div>
+        <span className="discover-sort-hint" role="status">
+          {sortBy === "date"
+            ? sortDirection === "asc" ? "Älteste zuerst" : "Neueste zuerst"
+            : sortBy === "outlier"
+              ? sortDirection === "asc" ? "Kleinste Multiplikatoren zuerst" : "Größte Multiplikatoren zuerst"
+              : sortDirection === "asc" ? "Wenigste Aufrufe zuerst" : "Meiste Aufrufe zuerst"}
+        </span>
+      </section>
+
+      <DiscoverFeed key={feedKey} signals={filtered} batchSize={perPage} controls={
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
+          Videos per row
+          <span className="pill-group">
+            {[3, 4, 5].map((n) => (
+              <button key={n} className={cols === n ? "active" : ""} onClick={() => setCols(n)}>{n}</button>
+            ))}
+          </span>
+        </span>
+      }>
+      {(shown) => shown.length === 0 ? (
+        <div className="empty-state">
+          {view === "saved"
+            ? "No saved videos match these filters. Save one from a card, or widen the window."
+            : `No ${isIg ? "Instagram" : "YouTube"} uploads match these filters. Add a creator under Tracked Channels.`}
+        </div>
+      ) : (
+        <div className={`signal-grid cols-${cols}`}>
+          {shown.map((signal, index) => {
+            const creator = creatorMap.get(signal.creatorId);
+            if (!creator) return null;
+            const reach = signal.plays ?? signal.views;
+            return (
+              <article className="signal-card" key={signal.id}>
+                <SignalMedia signal={signal} index={index} threshold={threshold} />
+                <div className="signal-content">
+                  <div className="signal-meta">
+                    <Link className="creator-link" href={creatorPath(creator.id, { from: "discover", threshold })}>{creator.handle}</Link>
+                    <span>{timeAgo(signal.publishedAt, nowMs)}</span>
+                    <span>{signal.topic}</span>
+                  </div>
+                  <h2>{signal.title}</h2>
+                  <p>{signal.caption ?? signal.reason}</p>
+                  <div className="signal-stats">
+                    <span><strong>{formatNumber(reach)}</strong> {isIg ? "plays" : "views"}</span>
+                    <span><strong>{formatNumber(signal.likes)}</strong> likes</span>
+                    <span><strong>{formatNumber(signal.comments)}</strong> comments</span>
+                    <span><strong className="lime">{(signal.outlier ?? 0).toFixed(1)}x</strong></span>
+                  </div>
+                  <div className="signal-actions">
+                    <span className="signal-buttons">
+                      {signal.format === "reel" && (
+                        <button className="ghost-button" type="button" onClick={() => onOpenReel(signal.id)}>
+                          <ArrowRight size={13} /> View Reel
+                        </button>
+                      )}
+                      <button
+                        className={isSaved(signal) ? "ghost-button active" : "ghost-button"}
+                        type="button"
+                        aria-pressed={isSaved(signal)}
+                        onClick={() => onToggleSaved(signal)}
+                      >
+                        <BookmarkSimple size={13} weight={isSaved(signal) ? "fill" : "regular"} /> {isSaved(signal) ? "Saved" : "Save"}
+                      </button>
+                      <button
+                        className="ghost-button"
+                        type="button"
+                        onClick={() =>
+                          onCreateIdea({
+                            title: signal.title,
+                            sourceSignalId: signal.id,
+                            sourceCreator: creator.handle,
+                            sourceUrl: signal.url,
+                          })
+                        }
+                      >
+                        <Lightbulb size={13} /> Create idea
+                      </button>
+                    </span>
+                    {signal.url && (
+                      <a className="signal-link" href={signal.url} target="_blank" rel="noreferrer">
+                        Open on {isIg ? "Instagram" : "YouTube"} <ArrowSquareOut size={11} />
+                      </a>
+                    )}
+                  </div>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+      </DiscoverFeed>
+
+      <aside className="explain-note">
+        <WarningCircle size={20} weight="fill" />
+        <div><strong>Designed for replacement</strong><p>{DEMO_SCORING_NOTE}</p></div>
+      </aside>
+    </div>
+  );
+}
+
+/**
+ * The Briefing tab: the daily document a Delta-Refresh leaves behind. Older days
+ * are pickable; the angle under each reel comes from the Bridge and is simply
+ * absent when it was down. Without a stored corpus the same pure composition
+ * runs over the demo fixtures, so the tab reads before the first refresh.
+ */
+function BriefingView({
+  state,
+  signals,
+  creators,
+  live,
+  onCompose,
+  onSelect,
+  onCreateIdea,
+  rankedSignals,
+  onOpenReel,
+  slate,
+}: {
+  state: BriefingState;
+  signals: SignalRecord[];
+  creators: Creator[];
+  live: boolean;
+  onCompose: () => void;
+  onSelect: (id: string) => void;
+  onCreateIdea: (input: IdeaInput) => void;
+  rankedSignals: Ranked[];
+  onOpenReel: (signalId: string) => void;
+  slate: SlateSectionProps;
+}) {
+  const stored = state.selected
+    ? state.briefings.find((item) => item.id === state.selected) ?? state.briefings[0]
+    : state.briefings[0];
+  // Demo mode never writes a document. The fixtures run through the same ranking.
+  const demo = useMemo(
+    () => (stored || live ? null : buildBriefing(signals, creators, { now: DEMO_NOW.getTime() })),
+    [stored, live, signals, creators],
+  );
+  const briefing = stored ?? demo;
+  const running = state.phase === "running";
+  const items = briefing?.items ?? [];
+  const day = briefing ? new Date(`${briefing.day}T12:00:00.000Z`) : new Date();
+  const signalMap = new Map(rankedSignals.map((signal) => [signal.id, signal]));
+
+  return (
+    <div className="view-stack">
+      <section className="hero">
+        <div>
+          <p className="hero-kicker">Editorial desk / last {briefing?.windowHours ?? BRIEFING_WINDOW_HOURS} hours</p>
+          <h1>{stored ? "Morning briefing" : "Morning briefing (demo)"}</h1>
+          <p className="hero-sub">
+            {day.toLocaleDateString("en-US", { weekday: "long", month: "short", day: "numeric" })}. The{" "}
+            {BRIEFING_LIMIT} strongest reels of the window, ranked by outlier times freshness, with one angle each.
+            {briefing && briefing.candidates > items.length
+              ? ` ${briefing.candidates - items.length} more reels landed in the window and did not make the cut.`
+              : ""}
+          </p>
+        </div>
+        <div className="stat-blocks">
+          <div><strong>{items.length}</strong><span>ranked reels</span></div>
+          <div><strong>{briefing?.sources ?? 0}</strong><span>sources</span></div>
+          <div className="lime"><strong>{items[0]?.score.toFixed(2) ?? "0.00"}</strong><span>top score</span></div>
+        </div>
+      </section>
+
+      <div className="review-actions">
+        <span>
+          {state.phase === "loading" && "Loading the briefings…"}
+          {state.phase === "error" && "The briefings could not be read."}
+          {state.error}
+          {!state.error && stored && state.phase !== "loading" && (
+            <>
+              Composed {formatStamp(stored.generatedAt)}
+              {stored.items.length > 0 && !stored.angles && " · no angles: the bridge was unreachable"}
+            </>
+          )}
+          {!state.error && !stored && state.phase === "ready" && (live
+            ? "No briefing yet. Every refresh writes one, or compose today's now."
+            : "Demo fixtures. Add a creator to the watchlist, then refresh.")}
+        </span>
+        <div className="brief-controls">
+          {state.briefings.length > 1 && (
+            <label className="sort-select">
+              Day
+              <select value={stored?.id ?? ""} onChange={(event) => onSelect(event.target.value)}>
+                {state.briefings.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.day} ({item.items.length})
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <button className="ghost-button" onClick={onCompose} disabled={running}>
+            {running ? "Composing…" : "Compose briefing"}
+          </button>
+        </div>
+      </div>
+
+      {briefing && items.length === 0 && (
+        <p className="empty-note">
+          Nothing was published in the last {briefing.windowHours} hours. The next refresh writes the next briefing.
+        </p>
+      )}
+
+      {items.length > 0 && (
+        <div className="briefing-list">
+          {items.map((item, index) => (
+            <article className={index === 0 ? "brief-row top" : "brief-row"} key={item.signalId}>
+              <span className="rank">{String(index + 1).padStart(2, "0")}</span>
+              <CoverImage signal={item} index={index} className="mini" lazy />
+              <div>
+                <div className="meta">
+                  <span>{item.creator}</span>
+                  {signalMap.get(item.signalId)?.format === "reel" && <TranscriptStatusBadge signal={signalMap.get(item.signalId)!} compact />}
+                  <strong>{item.score.toFixed(2)} score</strong>
+                  <span>{formatOutlier(item.outlier)} outlier</span>
+                  <span>{formatNumber(item.plays)} plays</span>
+                  <span>{ageInWindow(item.publishedAt, briefing?.generatedAt ?? item.publishedAt)}</span>
+                </div>
+                <h3>{item.title}</h3>
+                <p>{item.creatorName}: {item.caption || "No caption on this reel."}</p>
+                <div className="angle">
+                  <span>Your angle</span>
+                  {item.angle ?? "No angle yet. Compose the briefing again once the bridge is up."}
+                </div>
+              </div>
+              <div className="actions">
+                {signalMap.get(item.signalId)?.format === "reel" && (
+                  <button className="ghost-button" type="button" onClick={() => onOpenReel(item.signalId)}>
+                    <ArrowRight size={13} /> View Reel
+                  </button>
+                )}
+                <button
+                  className="ghost-button"
+                  type="button"
+                  onClick={() =>
+                    onCreateIdea({
+                      title: item.title,
+                      ...(item.angle ? { goal: item.angle } : {}),
+                      sourceSignalId: item.signalId,
+                      sourceCreator: item.creator,
+                      ...(item.url ? { sourceUrl: item.url } : {}),
+                    })
+                  }
+                >
+                  <Lightbulb size={13} /> Create idea
+                </button>
+                {item.url && (
+                  <a className="ghost-button" href={item.url} target="_blank" rel="noreferrer" aria-label="Open source"><ArrowSquareOut size={13} /></a>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+
+      <SlateSection {...slate} live={live} />
+    </div>
+  );
+}
+
+/** What the slate section needs from the shell: the stored slates and the five moves on them. */
+type SlateSectionProps = {
+  state: SlateState;
+  onCompose: (force: boolean) => void;
+  onSelect: (id: string) => void;
+  onRegenerate: (id: string, position: number) => void;
+  onDirection: (id: string, direction: string) => void;
+  onCapture: (id: string, position: number) => void;
+};
+
+/**
+ * The Produktions-Slate under the briefing: ten starting points the Bridge read
+ * from the same window, each with its topic label and the reel it came from.
+ * One start can be written anew while the other nine stay; a click turns one
+ * into an Idea; the direction typed here goes into every run after it.
+ */
+function SlateSection({ state, live, onCompose, onSelect, onRegenerate, onDirection, onCapture }: SlateSectionProps & { live: boolean }) {
+  const slate = state.selected
+    ? state.slates.find((item) => item.id === state.selected) ?? state.slates[0]
+    : state.slates[0];
+  const today = new Date().toISOString().slice(0, 10);
+  const isToday = slate?.day === today;
+  const running = state.phase === "running";
+  const busy = running || state.regenerating !== null || state.capturing !== null;
+
+  return (
+    <section className="panel slate-panel">
+      <div className="panel-head">
+        <div>
+          <p className="kicker">Production slate / last {slate?.windowHours ?? BRIEFING_WINDOW_HOURS} hours</p>
+          <h2>{slate ? `${slate.starts.length} starting points` : "Today's starting points"}</h2>
+          <p>
+            {SLATE_SIZE} short-form starting points the bridge read from the reels of the window, each with a topic and the reel it
+            came from. Regenerate one and the rest stay; a click turns one into an idea with its source reel.
+          </p>
+        </div>
+        <div className="brief-controls">
+          {state.slates.length > 1 && (
+            <label className="sort-select">
+              Day
+              <select value={slate?.id ?? ""} onChange={(event) => onSelect(event.target.value)}>
+                {state.slates.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.day} ({item.starts.length})
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {live && (
+            <button className={isToday ? "ghost-button" : "primary-button"} type="button" onClick={() => onCompose(isToday)} disabled={busy}>
+              {running ? "Composing…" : isToday ? "Rebuild today's slate" : "Compose today's slate"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="slate-status">
+        {state.phase === "loading" && "Loading the slates…"}
+        {state.phase === "error" && "The slates could not be read."}
+        {state.error && <span className="bad">{state.error}</span>}
+        {!state.error && slate && state.phase !== "loading" && (
+          <>
+            Composed {formatStamp(slate.generatedAt)}
+            {slate.updatedAt !== slate.generatedAt && ` · touched ${formatStamp(slate.updatedAt)}`}
+            {slate.directionApplied ? ` · direction applied: “${slate.directionApplied}”` : " · no direction yet"}
+          </>
+        )}
+        {!state.error && !slate && state.phase === "ready" && (live
+          ? "No slate yet. Every local refresh writes one, or compose today's now."
+          : "Demo fixtures. The slate reads the stored corpus only: add a creator to the watchlist, then refresh.")}
+      </div>
+
+      {slate && slate.starts.length === 0 && (
+        <p className="empty-note">
+          Nothing was published in the last {slate.windowHours} hours, so there was nothing to read a start from. The next refresh writes the next slate.
+        </p>
+      )}
+
+      {slate && slate.starts.length > 0 && (
+        <ol className="slate-list">
+          {slate.starts.map((start) => {
+            const regenerating = state.regenerating === start.position;
+            const capturing = state.capturing === start.position;
+            return (
+              <li className={regenerating ? "slate-row pending" : "slate-row"} key={start.position}>
+                <span className="rank">{String(start.position).padStart(2, "0")}</span>
+                <div>
+                  <div className="meta">
+                    <span className="topic">{start.topic}</span>
+                    <span>{start.sourceCreator}</span>
+                    <strong>{formatOutlier(start.outlier)} outlier</strong>
+                    <span>{formatNumber(start.plays)} plays</span>
+                    {start.regeneratedAt && <span>regenerated {formatStamp(start.regeneratedAt)}</span>}
+                  </div>
+                  <p className="pitch">{start.pitch}</p>
+                  <p className="source">
+                    From {start.sourceCreator}: {start.sourceTitle}
+                    {start.sourceUrl && (
+                      <a href={start.sourceUrl} target="_blank" rel="noreferrer" aria-label="Open source reel"><ArrowSquareOut size={12} /></a>
+                    )}
+                  </p>
+                </div>
+                <div className="actions">
+                  <button
+                    className="ghost-button"
+                    type="button"
+                    onClick={() => onRegenerate(slate.id, start.position)}
+                    disabled={busy}
+                    title="Write this start anew; the other starts stay"
+                  >
+                    <ArrowCounterClockwise size={13} className={regenerating ? "spin" : ""} /> {regenerating ? "Writing…" : "Regenerate"}
+                  </button>
+                  {start.ideaId ? (
+                    <span className="status-chip"><CheckCircle size={13} weight="fill" /> In ideas</span>
+                  ) : (
+                    <button className="ghost-button" type="button" onClick={() => onCapture(slate.id, start.position)} disabled={busy}>
+                      <Lightbulb size={13} /> {capturing ? "Capturing…" : "Create idea"}
+                    </button>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+
+      {slate && slate.id === state.slates[0]?.id ? (
+        <SlateDirectionForm key={slate.id} slate={slate} disabled={busy} onSave={(direction) => onDirection(slate.id, direction)} />
+      ) : slate ? (
+        <p className="slate-direction-note">
+          {slate.directionApplied ? `Direction this slate was given: “${slate.directionApplied}”.` : "This slate was given no direction."} The
+          direction for the next run is set on the newest slate.
+        </p>
+      ) : null}
+    </section>
+  );
+}
+
+/** The direction for the next run. Only the newest slate carries it, because that is the one the next run reads. */
+function SlateDirectionForm({ slate, disabled, onSave }: { slate: Slate; disabled: boolean; onSave: (direction: string) => void }) {
+  const [direction, setDirection] = useState(slate.direction ?? "");
+  const stored = slate.direction ?? "";
+  const dirty = direction.trim() !== stored;
+
+  return (
+    <form
+      className="slate-direction"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSave(direction.trim());
+      }}
+    >
+      <label htmlFor="slate-direction">Direction for the next run</label>
+      <textarea
+        id="slate-direction"
+        placeholder="e.g. mehr Werkzeug, weniger Meinung"
+        value={direction}
+        maxLength={SLATE_DIRECTION_MAX}
+        onChange={(event) => setDirection(event.target.value)}
+      />
+      <div className="slate-direction-foot">
+        <span>
+          {stored ? "Stored. Goes into every regenerated start and into tomorrow's slate until changed." : "Not stored yet. Once saved it goes into every run after this one."}
+        </span>
+        <button className="secondary-button" type="submit" disabled={disabled || !dirty}>Save direction</button>
+      </div>
+    </form>
+  );
+}
+
+function signedPercent(value: number) {
+  return `${value > 0 ? "+" : ""}${value.toFixed(1)}%`;
+}
+
+function RadarView({ state, demo, live, onSweep }: { state: TrendState; demo: TrendRadar; live: boolean; onSweep: () => void }) {
+  const radar = live ? state.radar : demo;
+  const topics = radar?.topics ?? [];
+  const currentPosts = topics.reduce((sum, topic) => sum + topic.currentPosts, 0);
+  const currentPlays = topics.reduce((sum, topic) => sum + topic.currentPlays, 0);
+  const loading = live && state.phase === "loading" && !radar;
+
+  return (
+    <div className="view-stack">
+      <section className="hero">
+        <div>
+          <p className="hero-kicker">Instagram hashtags / daily momentum</p>
+          <h1>Trend Radar</h1>
+          <p className="hero-sub">German Instagram posts are grouped by keyword rules. Momentum compares posts and plays with the previous week. Opportunity rises when few tracked creators cover the topic.</p>
+        </div>
+        <div className="hero-side">
+          <div className="stat-blocks">
+            <div><strong>{topics.length}</strong><span>topic clusters</span></div>
+            <div><strong>{formatNumber(currentPosts)}</strong><span>posts this week</span></div>
+            <div className="lime"><strong>{topics[0]?.opportunity.toFixed(1) ?? "0.0"}</strong><span>lead opportunity</span></div>
+          </div>
+          {live && <button className="secondary-button" type="button" onClick={onSweep} disabled={state.phase === "running"}><InstagramLogo size={15} /> {state.phase === "running" ? "Sweeping Instagram…" : "Run Instagram sweep"}</button>}
+        </div>
+      </section>
+
+      {!live && <div className="demo-note"><Pulse size={16} /><span>Demo snapshot. No Instagram or X source is queried until a real store and Apify token are configured.</span></div>}
+      {state.error && live && <div className="error-note"><WarningCircle size={16} /><span>{state.error}</span></div>}
+      {loading && <div className="empty-state">Loading hashtag trends…</div>}
+
+      {!loading && (
+        <>
+          <div className="section-head">
+            <div><p className="kicker">Topic opportunities</p><h2>Clusters with proof behind the momentum</h2></div>
+            <p className="note">Source: {radar?.sourceHashtags.join(", ") || "configured Instagram hashtags"}. {formatNumber(currentPlays)} plays in the current week.</p>
+          </div>
+          {topics.length === 0 && (
+            <div className="empty-state">
+              {live ? "No German hashtag posts in the two-week window. Run the Instagram sweep or adjust the configured hashtags." : "No demo hashtag topics available."}
+            </div>
+          )}
+          {topics.length > 0 && (
+            <div className="radar-rows">
+              {topics.map((topic, index) => (
+                <article className="radar-row" key={topic.topic}>
+                  <span className="rank">{String(index + 1).padStart(2, "0")}</span>
+                  <div className="radar-topic"><h3>{topic.label}</h3><div className="radar-tags">{topic.hashtags.slice(0, 3).map((hashtag) => <span className="tag" key={hashtag}>#{hashtag}</span>)}</div></div>
+                  <div className="radar-proof">
+                    <p>{topic.reason}</p>
+                    <a href={topic.lead.url ?? "#"} target="_blank" rel="noreferrer">Lead: {topic.lead.title} <ArrowSquareOut size={12} /></a>
+                  </div>
+                  <div className="metric"><strong>{signedPercent(topic.momentum)}</strong><span>momentum</span><small>posts {signedPercent(topic.postsMomentum)} · plays {signedPercent(topic.playsMomentum)}</small></div>
+                  <div className="metric"><strong>{formatNumber(topic.currentPosts)}</strong><span>posts vs {formatNumber(topic.previousPosts)}</span><small>{formatNumber(topic.currentPlays)} plays</small></div>
+                  <div className="metric"><strong>{Math.round(topic.coverage * 100)}%</strong><span>coverage</span><small>{topic.coveredCreators}/{topic.trackedCreators} creators</small></div>
+                  <div className="metric lime"><strong>{topic.opportunity.toFixed(1)}</strong><span>opportunity</span><small>momentum × gap</small></div>
+                </article>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function Sparkline({ values, lime }: { values: number[]; lime?: boolean }) {
+  const max = Math.max(1, ...values);
+  const points = values.map((v, i) => `${(i / Math.max(1, values.length - 1)) * 100},${40 - (v / max) * 36}`).join(" ");
+  return (
+    <svg viewBox="0 0 100 40" preserveAspectRatio="none" aria-hidden="true">
+      <polyline points={points} fill="none" stroke={lime ? "#b9ff5c" : "#8fd93a"} strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+      <polygon points={`0,40 ${points} 100,40`} fill="rgba(185,255,92,0.10)" />
+    </svg>
+  );
+}
+
+function FormatSection({ signal, threshold }: { signal: FormatSignal; threshold: number }) {
+  return (
+    <section className={signal.id === UNCLASSIFIED ? "format-section rest" : "format-section"}>
+      <div className="format-head">
+        <div><h2>{signal.label}</h2><p>{signal.hint}</p></div>
+        <div className="facts">
+          <span><strong>{signal.count}</strong> reels</span>
+          <span><strong>{signal.averageOutlier.toFixed(1)}x</strong> avg outlier</span>
+          <span><strong>{Math.round(signal.share * 100)}%</strong> of outliers</span>
+        </div>
+      </div>
+      <div className="format-strip">
+        {signal.examples.map((example, index) => (
+          <article key={example.id}>
+            <SignalMedia signal={example} index={index} threshold={threshold} />
+            <h3>{example.title}</h3>
+            <small>{formatNumber(example.plays ?? example.views)} plays · {example.outlier.toFixed(1)}x</small>
+          </article>
+        ))}
+      </div>
+      <div className="spark-row">
+        <div className="spark"><span>Reels per week</span><Sparkline values={signal.weeks} lime /></div>
+        <div className="spark"><span>Example outliers</span><Sparkline values={signal.examples.map((example) => example.outlier)} /></div>
+      </div>
+    </section>
+  );
+}
+
+const monthLabel = new Intl.DateTimeFormat("en", { month: "long", year: "numeric" });
+
+function formatMonth(iso: string) {
+  return monthLabel.format(new Date(iso));
+}
+
+/** A delta reads as a delta: the sign is always there, zero included. */
+function signed(value: number, digits = 0) {
+  return `${value > 0 ? "+" : value < 0 ? "\u2212" : "\u00b1"}${Math.abs(value).toFixed(digits)}`;
+}
+
+/** Share deltas are points of the corpus, not percent of a percent. */
+function signedPoints(value: number) {
+  return `${signed(Math.round(value * 100))} pt`;
+}
+
+/** What each badge means, spelled out under the header so the move never lives in a tooltip alone. */
+const MOVE_TITLE: Record<PatternMove, string> = {
+  new: "Not in the previous review",
+  up: "A larger slice of the outliers than last time",
+  down: "A smaller slice of the outliers than last time",
+  flat: "The share held inside one point",
+  gone: "No outlier reel carried this shape in this window",
+};
+
+const MOVE_ORDER: PatternMove[] = ["new", "up", "down", "flat", "gone"];
+
+function FormatReviewRow({ pattern }: { pattern: FormatReviewPattern }) {
+  return (
+    <li className={`review-row ${pattern.move}`}>
+      <span className="review-move" title={MOVE_TITLE[pattern.move]}>{pattern.move}</span>
+      <span className="review-label">{pattern.label}</span>
+      <span className="review-fact">
+        <strong>{Math.round(pattern.share * 100)}%</strong> of outliers <em>{signedPoints(pattern.shareDelta)}</em>
+      </span>
+      <span className="review-fact">
+        <strong>{pattern.count}</strong> reels <em>{signed(pattern.countDelta)}</em>
+      </span>
+      <span className="review-fact">
+        <strong>{pattern.averageOutlier.toFixed(1)}x</strong> avg <em>{signed(pattern.outlierDelta, 1)}</em>
+      </span>
+    </li>
+  );
+}
+
+/**
+ * "What changed": the monthly review the Convex cron writes on the first of the
+ * month. The button runs the same computation now, which is how the file store
+ * gets a review at all (ADR-0005).
+ */
+function FormatReviewPanel({ state, onRun }: { state: ReviewState; onRun: () => void }) {
+  const { review, phase } = state;
+  const running = phase === "running";
+
+  return (
+    <section className="review-panel">
+      <div className="format-group-head">
+        <h2>What changed</h2>
+        <p>
+          {review
+            ? review.previousReviewId
+              ? `Patterns of the trailing ${review.windowDays} days against the review of ${review.previousPeriodEnd?.slice(0, 10) ?? formatMonth(review.periodEnd)}. ${review.total} outlier reels, ${signed(review.total - review.previousTotal)} against last time.`
+              : `The first review, ${formatMonth(review.periodEnd)}. ${review.total} outlier reels, nothing to compare against yet.`
+            : "Recomputed on the first of every month over the trailing window, then diffed against the month before."}
+        </p>
+      </div>
+
+      <div className="review-actions">
+        <span>
+          {phase === "loading" && "Loading the last review\u2026"}
+          {phase === "error" && "The review could not be read."}
+          {review && phase !== "loading" && `Last run ${review.generatedAt.slice(0, 10)}`}
+          {!review && phase === "ready" && "No review yet."}
+        </span>
+        <button className="ghost-button" onClick={onRun} disabled={running}>
+          {running ? "Running\u2026" : "Run review now"}
+        </button>
+      </div>
+
+      {review && review.patterns.length > 0 && (
+        <dl className="review-legend">
+          {MOVE_ORDER.map((move) => (
+            <Fragment key={move}>
+              <dt className={`review-move ${move}`}>{move}</dt>
+              <dd>{MOVE_TITLE[move]}</dd>
+            </Fragment>
+          ))}
+        </dl>
+      )}
+
+      {review && review.patterns.length > 0 && (
+        <ol className="review-rows">
+          {review.patterns.map((pattern) => (
+            <FormatReviewRow key={pattern.id} pattern={pattern} />
+          ))}
+        </ol>
+      )}
+
+      {review && review.risingCreators.length > 0 && (
+        <div className="review-rising">
+          <h3>Small accounts to watch</h3>
+          <p>
+            The {FORMAT_REVIEW_RISING_LIMIT} strongest accounts under {formatNumber(FORMAT_REVIEW_SMALL_AUDIENCE)} followers whose outlier reel
+            carries a named shape, one reel each. A shape that is new this month sorts first.
+          </p>
+          <ul>
+            {review.risingCreators.map((entry) => (
+              <li key={entry.creatorId}>
+                <span className="handle">{entry.handle}</span>
+                <span className="audience">{formatNumber(entry.audience)} followers</span>
+                <span className={entry.patternMove === "new" ? "pattern new" : "pattern"}>{entry.patternLabel}</span>
+                <span className="outlier">{entry.outlier.toFixed(1)}x</span>
+                {entry.url ? (
+                  <a className="signal-link" href={entry.url} target="_blank" rel="noreferrer">
+                    {entry.title} <ArrowSquareOut size={12} />
+                  </a>
+                ) : (
+                  <span className="title">{entry.title}</span>
+                )}
+                {entry.foreign && <span className="foreign">foreign niche</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function FormatsView({
+  rankedSignals,
+  creators,
+  threshold,
+  review,
+  onRunReview,
+  patternComparisons,
+  signals,
+  live,
+  onDiscoverPattern,
+  onOpenReel,
+}: {
+  rankedSignals: Ranked[];
+  creators: Creator[];
+  threshold: number;
+  review: ReviewState;
+  onRunReview: () => void;
+  patternComparisons: PatternComparisonState;
+  signals: SignalRecord[];
+  live: boolean;
+  onDiscoverPattern: (sourceSignalIds: string[], scope: { market: "de" | "en"; niche: "core" | "foreign"; topic: string; ageBucket: "0-7" | "8-30" | "31-90"; owned: boolean }) => void;
+  onOpenReel: (id: string) => void;
+}) {
+  const { own, foreign, en } = useMemo(
+    () => buildFormatSignals(rankedSignals, creators, { now: Date.now(), threshold }),
+    [rankedSignals, creators, threshold],
+  );
+  const named = own.signals.filter((signal) => signal.id !== UNCLASSIFIED);
+  const rest = own.signals.find((signal) => signal.id === UNCLASSIFIED);
+
+  return (
+    <div className="view-stack">
+      <section className="hero">
+        <div>
+          <p className="hero-kicker">Pattern desk / trailing {FORMAT_WINDOW_DAYS} days</p>
+          <h1>Format Signals</h1>
+          <p className="hero-sub">
+            Recurring hook shapes read off the hook of every reel above {formatThreshold(threshold)} outlier: the spoken first sentence where a transcript exists, else the first caption line.
+            The list of shapes lives in lib/format-signals.ts; anything the rules miss is counted, not hidden.
+          </p>
+        </div>
+        <div className="stat-blocks">
+          <div><strong>{named.length}</strong><span>patterns found</span></div>
+          <div><strong>{own.total}</strong><span>{formatThreshold(threshold)}+ outlier reels</span></div>
+          <div className="lime"><strong>{rest ? Math.round(rest.share * 100) : 0}%</strong><span>unclassified</span></div>
+        </div>
+      </section>
+
+      <FormatReviewPanel state={review} onRun={onRunReview} />
+
+      <PatternComparisons state={patternComparisons} signals={signals} creators={creators} demo={live ? [] : demoPatternComparisons} onDiscover={onDiscoverPattern} onOpenReel={onOpenReel} />
+
+      {own.total === 0 && (
+        <div className="empty-state">
+          No reel above {formatThreshold(threshold)} outlier in the last {FORMAT_WINDOW_DAYS} days. Lower the threshold in Discover or refresh the watchlist.
+        </div>
+      )}
+
+      {own.signals.map((signal) => (
+        <FormatSection key={signal.id} signal={signal} threshold={threshold} />
+      ))}
+
+      {en.total > 0 && (
+        <>
+          <div className="format-group-head">
+            <h2>English market</h2>
+            <p>{en.total} outlier reels from English-market creators. Kept apart so their baselines never move the German numbers above.</p>
+          </div>
+          {en.signals.map((signal) => (
+            <FormatSection key={`en-${signal.id}`} signal={signal} threshold={threshold} />
+          ))}
+        </>
+      )}
+
+      {foreign.total > 0 && (
+        <>
+          <div className="format-group-head">
+            <h2>Foreign niche</h2>
+            <p>{foreign.total} outlier reels from creators marked as foreign niche. Kept apart so imported shapes never move the numbers above.</p>
+          </div>
+          {foreign.signals.map((signal) => (
+            <FormatSection key={`foreign-${signal.id}`} signal={signal} threshold={threshold} />
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Wall clock in the sweep's zone, so the box reads the same wherever the browser sits. */
+function formatRefreshInstant(at: Date) {
+  return new Intl.DateTimeFormat("en-GB", { timeZone: REFRESH_TIME_ZONE, weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(at) + ` ${REFRESH_ZONE_LABEL}`;
+}
+
+function ChannelsView({
+  creators,
+  rankedSignals,
+  network,
+  onNetwork,
+  onAdd,
+  onToggleForeign,
+  onToggleOwned,
+  issues,
+  lastRun,
+}: {
+  creators: Creator[];
+  rankedSignals: Ranked[];
+  network: Network;
+  onNetwork: (network: Network) => void;
+  onAdd: () => void;
+  /** Flips the foreign-niche mark that splits the Format Signals tab. */
+  onToggleForeign: (creator: Creator) => void;
+  /** Flips the owned mark that moves a creator out of the research views into Profile. */
+  onToggleOwned: (creator: Creator) => void;
+  /** Creators that failed in the most recent run. */
+  issues: number;
+  /** The most recent logged run, cron or manual; null before the first one or while the log is loading. */
+  lastRun: Run | null;
+}) {
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState("name");
+  const nowMs = Date.now();
+  const nextRefresh = nextRefreshAt(new Date(nowMs));
+  const list = creators
+    .filter((creator) => creator.network === network)
+    .filter((creator) => creator.name.toLowerCase().includes(query.toLowerCase()) || creator.handle.toLowerCase().includes(query.toLowerCase()))
+    .sort((a, b) => (sort === "name" ? a.name.localeCompare(b.name) : b.audience - a.audience));
+  const yt = creators.filter((c) => c.network === "youtube").length;
+  const ig = creators.filter((c) => c.network === "instagram").length;
+  const checked = creators.filter((c) => c.lastCheckedAt || rankedSignals.some((s) => s.creatorId === c.id)).length;
+
+  return (
+    <div className="view-stack">
+      <section className="hero">
+        <div>
+          <p className="hero-kicker">Watchlist / {network === "instagram" ? "Instagram" : "YouTube"}</p>
+          <h1>Tracked channels</h1>
+          <p className="hero-sub">Add a creator and Signal Room immediately pulls their last 90 days of uploads, then the daily sweep keeps their newest work and performance observations current.</p>
+        </div>
+        <div className="next-refresh">
+          <span>Next refresh</span>
+          <strong>{formatRefreshInstant(nextRefresh)}</strong>
+          <span className="next-refresh-last">Last run</span>
+          <strong>{lastRun ? `${formatRefreshInstant(new Date(lastRun.startedAt))} · ${lastRun.kind} ${lastRun.status}` : "No run logged yet"}</strong>
+        </div>
+      </section>
+
+      <div className="channel-tabs" role="tablist">
+        <button className={network === "youtube" ? "active" : ""} onClick={() => onNetwork("youtube")}>
+          <YoutubeLogo size={18} weight="fill" />
+          <span><strong>YouTube channels</strong><small>{yt} active</small></span>
+        </button>
+        <button className={network === "instagram" ? "active" : ""} onClick={() => onNetwork("instagram")}>
+          <InstagramLogo size={18} />
+          <span><strong>IG creators</strong><small>{ig} tracked</small></span>
+        </button>
+      </div>
+
+      <form
+        className="add-row"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onAdd();
+        }}
+      >
+        <div>
+          <label htmlFor="add-creator">Add creator</label>
+          <input id="add-creator" placeholder={network === "instagram" ? "https://instagram.com/creator" : "https://youtube.com/@creator"} onFocus={onAdd} readOnly />
+        </div>
+        <button className="primary-button" type="submit"><Plus size={15} weight="bold" /> Add to daily watch</button>
+      </form>
+
+      <div className="stat-row">
+        <div><strong>{list.length}</strong><span>Active creators</span></div>
+        <div><strong>{checked}</strong><span>Checked at least once</span></div>
+        <div><strong>{rankedSignals.filter((s) => creators.find((c) => c.id === s.creatorId)?.network === network).length}</strong><span>Videos retained</span></div>
+        <div><strong>{issues}</strong><span>Collection issues</span></div>
+      </div>
+
+      <div className="table-tools">
+        <div className="search-box"><MagnifyingGlass size={14} /><input placeholder="Search creators" value={query} onChange={(e) => setQuery(e.target.value)} /></div>
+        <div className="sort-select">SORT <select value={sort} onChange={(e) => setSort(e.target.value)}><option value="name">Name A to Z</option><option value="audience">Audience</option></select></div>
+      </div>
+
+      <table className="desk-table">
+        <thead>
+          <tr><th>Creator</th><th>Status</th><th className="hide-sm">Corpus</th><th className="hide-sm">Latest video</th><th className="right">Controls</th></tr>
+        </thead>
+        <tbody>
+          {list.map((creator) => {
+            const own = rankedSignals.filter((s) => s.creatorId === creator.id).sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
+            const reach = own.map((s) => s.plays ?? s.views).sort((a, b) => a - b);
+            const median = reach.length ? reach[Math.floor(reach.length / 2)] : 0;
+            return (
+              <tr key={creator.id}>
+                <td>
+                  <div className="creator-cell">
+                    <span className="creator-avatar" style={{ background: creator.accent }}>
+                      {creator.avatarUrl ? <img src={creator.avatarUrl} alt="" referrerPolicy="no-referrer" /> : creator.name.slice(0, 2).toUpperCase()}
+                    </span>
+                    <div><Link className="creator-link strong" href={creatorPath(creator.id, { from: "channels" })}>{creator.name}</Link><small>{creator.handle} · {creator.audience ? `${formatNumber(creator.audience)} ${network === "instagram" ? "followers" : "subs"}` : "Pending"}</small></div>
+                  </div>
+                </td>
+                <td>
+                  <span className="status-chip"><CheckCircle size={14} weight="fill" /> Watching · {creator.lastCheckedAt ? `checked ${timeAgo(creator.lastCheckedAt, nowMs)}` : "checked 8h ago"}</span>
+                  {isOwned(creator) && <span className="niche-chip owned">Own account</span>}
+                  {creator.foreign && <span className="niche-chip">Foreign niche</span>}
+                  {creator.market === "en" && <span className="niche-chip">EN</span>}
+                </td>
+                <td className="hide-sm"><span className="num">{own.length}</span> <span className="muted">videos · {formatNumber(median)} median</span></td>
+                <td className="hide-sm"><span className="muted">{own[0]?.title ?? "No uploads retained yet"}</span></td>
+                <td>
+                  <div className="controls">
+                    <button
+                      className={isOwned(creator) ? "icon-button active" : "icon-button"}
+                      onClick={() => onToggleOwned(creator)}
+                      aria-pressed={isOwned(creator)}
+                      title={isOwned(creator) ? "Own account: read in Profile, kept out of Discover, Briefing and Format Signals" : "Mark as my own account"}
+                      aria-label="Toggle own account"
+                    >
+                      <UserCircle size={14} />
+                    </button>
+                    <button
+                      className={creator.foreign ? "icon-button active" : "icon-button"}
+                      onClick={() => onToggleForeign(creator)}
+                      aria-pressed={Boolean(creator.foreign)}
+                      title={creator.foreign ? "Foreign niche: their patterns stay in their own group" : "Mark as foreign niche"}
+                      aria-label="Toggle foreign niche"
+                    >
+                      <Globe size={14} />
+                    </button>
+                    <button className="icon-button" aria-label="Refresh creator"><ArrowsClockwise size={14} /></button>
+                    <button className="icon-button" aria-label="Remove creator"><Trash size={14} /></button>
+                    {creator.url && <a className="icon-button" href={creator.url} target="_blank" rel="noreferrer" aria-label="Open channel"><ArrowSquareOut size={14} /></a>}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+          {list.length === 0 && (
+            <tr><td colSpan={5}><div className="empty-state">No {network === "instagram" ? "Instagram" : "YouTube"} creators tracked yet.</div></td></tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** What the user has to do to get the bridge into a usable state. */
+const bridgeCopy: Record<BridgeHealth, { label: string; hint: string; tone: "muted" | "ok" | "bad" }> = {
+  checking: { label: "Checking the bridge", hint: "One moment.", tone: "muted" },
+  online: { label: "Bridge reachable, Codex logged in", hint: "Ready.", tone: "ok" },
+  offline: { label: "Bridge not reachable", hint: "Run npm run bridge in a second terminal.", tone: "bad" },
+  "logged-out": { label: "Codex not logged in", hint: "Run codex login in a terminal, then check again.", tone: "bad" },
+};
+
+/** The six stages plus dropped, as the chips and the counter bar name them. */
+const statusCopy: Record<IdeaStatus, string> = {
+  captured: "Captured",
+  developing: "Developing",
+  packaging: "Packaging",
+  scripting: "Scripting",
+  producing: "Producing",
+  published: "Published",
+  dropped: "Dropped",
+};
+
+function formatDay(iso: string) {
+  return new Date(iso).toLocaleDateString(undefined, { day: "2-digit", month: "short", year: "numeric" });
+}
+
+const potentialCopy: Record<NonNullable<Forecast["potential"]>, string> = {
+  low: "Low potential",
+  medium: "Medium potential",
+  high: "High potential",
+};
+
+/**
+ * The one line the list shows: the range and potential, or the honest "no
+ * forecast". A developed idea without a forecast says so too, so a missing
+ * number is never mistaken for a pending one.
+ */
+function forecastLine(forecast: Forecast | undefined) {
+  if (!forecast) return "No forecast: the bridge answered without one";
+  if (!forecast.range || !forecast.potential) return "No forecast: fewer than two comparable reels in the evidence";
+  return `${formatNumber(forecast.range.low)}–${formatNumber(forecast.range.high)} plays · ${potentialCopy[forecast.potential]} · ${forecast.comparableCount} comparable reels`;
+}
+
+function coverFormatLabel(board: CoverBoard) {
+  return board.format === "reel" ? `Instagram Reel · ${board.aspectRatio}` : `YouTube · ${board.aspectRatio}`;
+}
+
+/** The Idea row shows both format slots together, so a new run cannot hide the other board. */
+function CoverBoardsPreview({ boards }: { boards?: CoverBoard[] }) {
+  if (!boards || boards.length === 0) return null;
+  return (
+    <div className="idea-covers">
+      <div className="idea-covers-head"><span>Cover Lab</span><span>{boards.length}/2 formats</span></div>
+      <div className="idea-covers-grid">
+        {boards.map((board) => (
+          <section key={board.format}>
+            <header><strong>{coverFormatLabel(board)}</strong><span>{board.treatment === "face" ? "with face" : "faceless"}</span></header>
+            <div className="idea-cover-strip">
+              {board.packages.map((pkg) => (
+                <div className="idea-cover-thumb" key={pkg.id}>
+                  {pkg.imageUrl ? <img src={pkg.imageUrl} alt={`${coverFormatLabel(board)}: ${pkg.textOverlay}`} /> : <span />}
+                  <small>{pkg.textOverlay}</small>
+                </div>
+              ))}
+            </div>
+          </section>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** One stored idea with its storyboard folded away until it is wanted. */
+function IdeaRow({
+  idea,
+  index,
+  script,
+  developing,
+  blocked,
+  onDevelop,
+  onMove,
+}: {
+  idea: Idea;
+  index: number;
+  script?: Script;
+  developing: boolean;
+  blocked: boolean;
+  onDevelop: (id: string) => void;
+  onMove: (id: string, status: IdeaStatus) => void;
+}) {
+  const next = nextStage(idea.status);
+  const legacyStoryboard = idea.storyboard ? isLegacyStoryboard(idea.storyboard) : false;
+  const outdatedStoryboard = idea.storyboard ? isStoryboardOutdated(idea.storyboard, script) : false;
+  // "since" says how long the idea has sat on its stage; a fresh capture has no second date.
+  const meta = [
+    formatDay(idea.createdAt),
+    idea.status !== "captured" && `${statusCopy[idea.status].toLowerCase()} since ${formatDay(idea.updatedAt)}`,
+    idea.sourceCreator && `from ${idea.sourceCreator}`,
+    idea.evidenceCount && `${idea.evidenceCount} reels as evidence`,
+  ].filter(Boolean);
+  const sourceLabel = idea.sourceCreator ? `Source reel ${idea.sourceCreator}` : "Source reel";
+
+  return (
+    <div className="idea-entry">
+      <div className="idea-row">
+        <span className="rank">{String(index + 1).padStart(2, "0")}</span>
+        <div>
+          <small>{meta.join(" · ")}</small>
+          <h3>{idea.title}</h3>
+          {idea.goal && <p className="idea-goal">{idea.goal}</p>}
+          {script && (
+            <Link className="signal-link idea-script-link" href={`/script/${encodeURIComponent(script.id)}?from=ideas`}>
+              Script · {scriptStatusCopy[script.status]} · {scriptHook(script)}
+            </Link>
+          )}
+          {idea.storyboard && (
+            <p className={idea.forecast?.range ? `forecast-line potential-${idea.forecast.potential}` : "forecast-line potential-none"}>
+              <ChartLineUp size={11} /> {forecastLine(idea.forecast)}
+            </p>
+          )}
+          {idea.sourceSignalId &&
+            (idea.sourceUrl ? (
+              <a className="signal-link" href={idea.sourceUrl} target="_blank" rel="noreferrer">
+                {sourceLabel} <ArrowSquareOut size={11} />
+              </a>
+            ) : (
+              <span className="signal-link">{sourceLabel}</span>
+            ))}
+        </div>
+        <div className="idea-actions">
+          <span className={`state status-${idea.status}`}>{statusCopy[idea.status]}</span>
+          {next && (
+            <button className="ghost-button" type="button" onClick={() => onMove(idea.id, next)} disabled={developing} title={`Move to ${statusCopy[next]}`}>
+              <ArrowRight size={13} /> {statusCopy[next]}
+            </button>
+          )}
+          {canTransition(idea.status, "dropped") && (
+            <button className="ghost-button" type="button" onClick={() => onMove(idea.id, "dropped")} disabled={developing} title="Drop this idea">
+              <Trash size={13} />
+            </button>
+          )}
+          <button
+            className="ghost-button"
+            type="button"
+            onClick={() => onDevelop(idea.id)}
+            disabled={blocked || developing || (!script && !canTransition(idea.status, "developing"))}
+          >
+            {developing ? (
+              <>
+                <ArrowsClockwise className="spin" size={13} /> Developing
+              </>
+            ) : (
+              <>
+                <Sparkle size={13} /> {script ? (idea.storyboard ? "Develop again" : "Open script") : idea.status === "developing" ? "Retry Hook run" : "Develop idea"}
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+      {idea.storyboard && (
+        <details className="storyboard">
+          <summary>
+            Storyboard
+            <span className="storyboard-summary-meta">
+              {legacyStoryboard && <em className="storyboard-badge legacy">Legacy</em>}
+              {outdatedStoryboard && <em className="storyboard-badge stale">Storyboard älter als das Skript</em>}
+              {idea.developedAt ? formatStamp(idea.developedAt) : ""}
+            </span>
+          </summary>
+          <dl>
+            <dt>Hook</dt>
+            <dd>{idea.storyboard.hook}</dd>
+            {idea.storyboard.beats.map((beat, position) => (
+              <Fragment key={`${idea.id}-beat-${position}`}>
+                <dt>Beat {position + 1} · {beat.label}</dt>
+                <dd>{beat.detail}</dd>
+              </Fragment>
+            ))}
+            <dt>CTA</dt>
+            <dd>{idea.storyboard.cta}</dd>
+            <dt>Caption</dt>
+            <dd>{idea.storyboard.caption}</dd>
+            <dt>Takeaway</dt>
+            <dd>{idea.storyboard.takeaway}</dd>
+            <dt>Comment CTA</dt>
+            <dd>{idea.storyboard.commentCta || "Noch nicht befüllt"}</dd>
+            <dt>Lead-Magnet CTA</dt>
+            <dd>{idea.storyboard.leadMagnetCta || "Noch nicht befüllt"}</dd>
+            <dt>Forecast</dt>
+            <dd>{forecastLine(idea.forecast)}</dd>
+            {idea.forecast && (
+              <>
+                <dt>Biggest risk</dt>
+                <dd>{idea.forecast.risk}</dd>
+                <dt>Tension</dt>
+                <dd>{idea.forecast.tension}</dd>
+              </>
+            )}
+          </dl>
+        </details>
+      )}
+      <CoverBoardsPreview boards={idea.coverBoards} />
+    </div>
+  );
+}
+
+const scriptStatusCopy: Record<ScriptStatus, string> = {
+  "hook-selection": "Hook Selection",
+  draft: "Draft",
+  review: "Review",
+  approved: "Approved",
+};
+
+function scriptHook(script: Script) {
+  return script.hookOptions.find((option) => option.id === script.selectedHookId)?.hook
+    ?? script.sections.find((section) => section.kind === "hook")?.text
+    ?? "No hook selected yet";
+}
+
+function ScriptsView({ state, signals, ideas, onReload }: { state: ScriptsState; signals: SignalRecord[]; ideas: Idea[]; onReload: () => void }) {
+  const [status, setStatus] = useState<ScriptStatus | null>(null);
+  const counts = countByStatus(state.items);
+  const visible = status ? state.items.filter((script) => script.status === status) : state.items;
+  const signalMap = new Map(signals.map((signal) => [signal.id, signal]));
+
+  return (
+    <div className="view-stack">
+      <section className="hero">
+        <div>
+          <p className="hero-kicker">Scripts / production studio</p>
+          <h1>Scripts</h1>
+          <p className="hero-sub">A separate home for Hook Selection, Draft, Review and Approved scripts. Every script keeps its Idea, source Reel and evidence close by.</p>
+        </div>
+        <div className="stat-blocks">
+          <div><strong>{state.items.length}</strong><span>script projects</span></div>
+          <div><strong>{counts["hook-selection"] + counts.draft}</strong><span>still in progress</span></div>
+          <div className="lime"><strong>{counts.approved}</strong><span>approved</span></div>
+        </div>
+      </section>
+
+      <section className="panel script-list-panel">
+        <div className="panel-head">
+          <div>
+            <p className="kicker">Script repository</p>
+            <h2>What is waiting for a decision?</h2>
+            <p>The script is its own object. Open one to see its Hook options, framework, sections and evidence.</p>
+          </div>
+          <button className="ghost-button" type="button" onClick={onReload}><ArrowsClockwise size={13} /> Reload</button>
+        </div>
+
+        <div className="stage-bar script-status-bar" role="group" aria-label="Scripts by status">
+          {SCRIPT_STATUSES.map((item) => (
+            <button
+              key={item}
+              type="button"
+              className={`${item === status ? "active" : ""} status-${item}`}
+              aria-pressed={item === status}
+              onClick={() => setStatus((current) => current === item ? null : item)}
+            >
+              <strong>{counts[item]}</strong> {scriptStatusCopy[item]}
+            </button>
+          ))}
+        </div>
+
+        {state.phase === "loading" && <div className="empty-state">Reading the Scripts table.</div>}
+        {state.phase === "error" && <div className="empty-state">The Scripts table is unreachable.</div>}
+        {state.phase === "ready" && state.items.length === 0 && <div className="empty-state">No script project yet. Develop an Idea to open one.</div>}
+        {state.phase === "ready" && state.items.length > 0 && visible.length === 0 && status && <div className="empty-state">No script in {scriptStatusCopy[status]}.</div>}
+        {visible.map((script, index) => (
+          <ScriptRow key={script.id} script={script} index={index} source={script.sourceSignalId ? signalMap.get(script.sourceSignalId) : undefined} ideas={ideas} />
+        ))}
+      </section>
+    </div>
+  );
+}
+
+function ScriptRow({ script, index, source, ideas }: { script: Script; index: number; source?: SignalRecord; ideas: Idea[] }) {
+  const title = ideas.find((idea) => idea.id === script.ideaId)?.title ?? demoScriptIdeaTitles[script.ideaId] ?? script.ideaId;
+  return (
+    <article className="script-entry">
+      <div className="script-row">
+        <span className="rank">{String(index + 1).padStart(2, "0")}</span>
+        <div className="script-main">
+          <small>{title}</small>
+          <Link className="script-title" href={`/script/${encodeURIComponent(script.id)}?from=scripts`}>{scriptHook(script)}</Link>
+          <p>{script.sections.length ? `${script.sections.length} sections` : "Hook options ready"} · {script.evidenceSignalIds.length} evidence Reels</p>
+        </div>
+        <span className={`state status-${script.status}`}>{scriptStatusCopy[script.status]}</span>
+        <span className="script-revision">Rev. {script.revision}</span>
+        <div className="script-source">
+          {source?.url ? <a className="signal-link" href={source.url} target="_blank" rel="noreferrer">{source.title} <ArrowSquareOut size={11} /></a> : <span className="muted">{source?.title ?? "No source Reel"}</span>}
+        </div>
+        <time dateTime={script.updatedAt}>{formatStamp(script.updatedAt)}</time>
+      </div>
+    </article>
+  );
+}
+
+function IdeasView({
+  bridge,
+  ideas,
+  onCapture,
+  onDevelop,
+  onMove,
+  onReloadIdeas,
+  scripts,
+}: {
+  bridge: BridgeHealth;
+  ideas: IdeasState;
+  onCapture: (input: IdeaInput) => void;
+  onDevelop: (id: string) => void;
+  onMove: (id: string, status: IdeaStatus) => void;
+  onReloadIdeas: () => void;
+  scripts: Script[];
+}) {
+  const [idea, setIdea] = useState("");
+  const [goal, setGoal] = useState("");
+  /** The stage the list is narrowed to; null shows every idea. */
+  const [stage, setStage] = useState<IdeaStatus | null>(null);
+  const counts = countByStage(ideas.items);
+  const visible = stage ? ideas.items.filter((item) => item.status === stage) : ideas.items;
+  const developBlocked = bridge === "offline" || bridge === "logged-out";
+  const captureTitle = idea.trim();
+  const scriptsByIdea = new Map(scripts.map((script) => [script.ideaId, script]));
+  const developed = ideas.items.filter((item) => scriptsByIdea.has(item.id)).length;
+
+  function capture() {
+    onCapture({ title: captureTitle, goal: goal.trim() });
+    setIdea("");
+    setGoal("");
+  }
+
+  return (
+    <div className="view-stack">
+      <section className="hero">
+        <div>
+          <p className="hero-kicker">Idea repository / strategy desk</p>
+          <h1>Ideas</h1>
+          <p className="hero-sub">Inbox für neue Ansätze. Erfasse eine Idea, öffne ihr Skriptprojekt oder verwirf sie.</p>
+        </div>
+        <div className="stat-blocks">
+          <div><strong>{ideas.items.length}</strong><span>Ideas in der Inbox</span></div>
+          <div><strong>{counts.captured}</strong><span>noch nicht entwickelt</span></div>
+          <div className="lime"><strong>{developed}</strong><span>script projects</span></div>
+        </div>
+      </section>
+
+      <section className="panel glow">
+        <div className="panel-head">
+          <div>
+            <p className="kicker">Working idea</p>
+            <h2>What are you thinking about making?</h2>
+            <p>One line is enough. The goal tells the bridge what the viewer should walk away with.</p>
+          </div>
+        </div>
+
+        <div className="panel-body">
+          <div>
+            <label htmlFor="idea-text">Idea</label>
+            <textarea id="idea-text" placeholder="Paste the premise, a hook, or the thing you noticed." value={idea} onChange={(e) => setIdea(e.target.value)} />
+            <p className="count">{idea.length} characters</p>
+          </div>
+          <div>
+            <label htmlFor="idea-goal">Goal · optional</label>
+            <textarea id="idea-goal" placeholder="What should the viewer be able to do after watching?" value={goal} onChange={(e) => setGoal(e.target.value)} />
+          </div>
+        </div>
+        <div className="panel-foot">
+          <span>Der Develop-Schritt öffnet das Skriptprojekt und startet dort die Hook-Auswahl.</span>
+          <button className="primary-button" type="button" onClick={capture} disabled={!captureTitle}>Capture idea</button>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <p className="kicker">Idea repository</p>
+            <h2>Captured ideas</h2>
+            <p>Stored in the ideas table. Develop opens a Script and sends its evidence packet to the Hook bridge.</p>
+          </div>
+          <button className="ghost-button" type="button" onClick={onReloadIdeas}>
+            <ArrowsClockwise size={13} /> Reload
+          </button>
+        </div>
+        {ideas.error && (
+          <div className="strategy-error">
+            <WarningCircle size={20} weight="fill" />
+            <h3>The last idea action failed</h3>
+            <p>{ideas.error}</p>
+          </div>
+        )}
+        <div className="stage-bar" role="group" aria-label="Ideas by stage">
+          {IDEA_STATUSES.map((status) => (
+            <button
+              key={status}
+              type="button"
+              className={`${status === stage ? "active" : ""} status-${status}`}
+              aria-pressed={status === stage}
+              onClick={() => setStage((current) => (current === status ? null : status))}
+            >
+              <strong>{counts[status]}</strong> {statusCopy[status]}
+            </button>
+          ))}
+        </div>
+        {ideas.phase === "loading" && <div className="empty-state">Reading the ideas table.</div>}
+        {ideas.phase === "error" && <div className="empty-state">The ideas table is unreachable.</div>}
+        {ideas.phase === "ready" && ideas.items.length === 0 && (
+          <div className="empty-state">No idea captured yet. Capture one above, or from a card in Discover.</div>
+        )}
+        {ideas.phase === "ready" && ideas.items.length > 0 && visible.length === 0 && stage && (
+          <div className="empty-state">No idea on {statusCopy[stage]}. Click the chip again to show every idea.</div>
+        )}
+        {visible.map((item, index) => (
+          <IdeaRow
+            key={item.id}
+            idea={item}
+            index={index}
+            script={scriptsByIdea.get(item.id)}
+            developing={ideas.developing === item.id}
+            blocked={(!scriptsByIdea.has(item.id) && developBlocked) || (ideas.developing !== null && ideas.developing !== item.id)}
+            onDevelop={onDevelop}
+            onMove={onMove}
+          />
+        ))}
+      </section>
+
+    </div>
+  );
+}
+
+function CoverBoardPanel({
+  format,
+  board,
+  running,
+  onRegenerate,
+}: {
+  format: CoverFormat;
+  board?: CoverBoard;
+  running: boolean;
+  onRegenerate: (input: CoverRun) => void;
+}) {
+  const spec = COVER_FORMATS[format];
+  return (
+    <section className="cover-board-panel">
+      <header>
+        <div>
+          <p className="kicker">{spec.label}</p>
+          <h3>{spec.aspectRatio} <span>{board ? (board.treatment === "face" ? "with face" : "faceless") : "not rendered"}</span></h3>
+        </div>
+        <span className="cover-safe-zone">{spec.safeZone}</span>
+      </header>
+      {!board && <div className="cover-board-empty">No {spec.label} board yet. Run this format beside the other one.</div>}
+      {board && (
+        <div className="cover-package-grid">
+          {board.packages.map((pkg, index) => (
+            <article className="cover-package" key={pkg.id}>
+              <div className={`cover-art ${format}`}>
+                {pkg.imageUrl ? <img src={pkg.imageUrl} alt={`${spec.label} cover ${index + 1}: ${pkg.textOverlay}`} /> : <span>Image not available</span>}
+              </div>
+              <div className="cover-package-body">
+                <div className="cover-package-heading"><span className="rank">{String(index + 1).padStart(2, "0")}</span><h4>{pkg.label}</h4></div>
+                <p className="cover-overlay">“{pkg.textOverlay}”</p>
+                <dl>
+                  <dt>Image idea</dt><dd>{pkg.imageIdea}</dd>
+                  <dt>Color world</dt><dd>{pkg.colorWorld}</dd>
+                </dl>
+                <details className="cover-prompt">
+                  <summary>Image prompt</summary>
+                  <p>{pkg.imagePrompt}</p>
+                </details>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => onRegenerate({ ideaId: "", format, treatment: board.treatment, packageId: pkg.id })}
+                  disabled={running}
+                >
+                  <ArrowCounterClockwise className={running ? "spin" : ""} size={14} /> {running ? "Rendering…" : "Render again"}
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ThumbnailsView({
+  ideas,
+  bridge,
+  covers,
+  onGenerate,
+  onRecheckBridge,
+}: {
+  ideas: Idea[];
+  bridge: BridgeHealth;
+  covers: CoverState;
+  onGenerate: (input: CoverRun) => void;
+  onRecheckBridge: () => void;
+}) {
+  const developedIdeas = ideas.filter((idea) => Boolean(idea.storyboard));
+  const [selectedId, setSelectedId] = useState("");
+  const [format, setFormat] = useState<CoverFormat>("reel");
+  const [treatment, setTreatment] = useState<CoverTreatment>("faceless");
+  const selectedIdea = developedIdeas.find((idea) => idea.id === selectedId) ?? developedIdeas[0];
+  const packageCount = ideas.reduce((sum, idea) => sum + (idea.coverBoards?.reduce((boards, board) => boards + board.packages.length, 0) ?? 0), 0);
+  const renderedCount = ideas.reduce((sum, idea) => sum + (idea.coverBoards?.reduce((rendered, board) => rendered + board.packages.filter((pkg) => pkg.imageUrl).length, 0) ?? 0), 0);
+  const status = bridgeCopy[bridge];
+  const blocked = !selectedIdea || bridge === "offline" || bridge === "logged-out" || covers.phase === "loading";
+
+  useEffect(() => {
+    if (!selectedId || !developedIdeas.some((idea) => idea.id === selectedId)) setSelectedId(developedIdeas[0]?.id ?? "");
+  }, [developedIdeas, selectedId]);
+
+  function regenerate(input: CoverRun) {
+    if (!selectedIdea) return;
+    onGenerate({ ...input, ideaId: selectedIdea.id });
+  }
+
+  return (
+    <div className="view-stack">
+      <section className="hero">
+        <div>
+          <p className="hero-kicker">Cover Lab / visual direction</p>
+          <h1>Cover Lab</h1>
+          <p className="hero-sub">Build three readable cover packages from a developed Idea. Reel and YouTube layouts stay side by side, each with its own safe zone.</p>
+        </div>
+        <div className="stat-blocks">
+          <div><strong>{packageCount}</strong><span>packages on Ideas</span></div>
+          <div><strong>{renderedCount}</strong><span>images rendered</span></div>
+          <div className="lime"><strong>4:5 + 16:9</strong><span>format slots</span></div>
+        </div>
+      </section>
+
+      <section className="panel glow">
+        <div className="panel-head">
+          <div><p className="kicker">Developed Idea</p><h2>What should this cover promise?</h2><p>The Bridge receives the Idea's storyboard, then creates one focused visual direction per package.</p></div>
+          <div className="next-refresh"><span>No separate API key</span><strong>Uses the local Codex sign-in and writes images to the ignored cover cache.</strong></div>
+        </div>
+        <div className="bridge-status-row">
+          <div className={`bridge-status ${status.tone}`}>
+            <span className="dot" aria-hidden="true" />
+            <div><strong>{status.label}</strong><p>{status.hint}</p></div>
+            <button className="ghost-button" type="button" onClick={onRecheckBridge}><ArrowsClockwise size={13} /> Check again</button>
+          </div>
+        </div>
+        <div className="panel-body cover-controls">
+          <div>
+            <label htmlFor="cover-idea">Idea</label>
+            {developedIdeas.length > 0 ? (
+              <select id="cover-idea" value={selectedIdea?.id ?? ""} onChange={(event) => setSelectedId(event.target.value)}>
+                {developedIdeas.map((idea) => <option key={idea.id} value={idea.id}>{idea.title}</option>)}
+              </select>
+            ) : (
+              <div className="cover-board-empty">Develop an Idea first. Cover Lab needs its storyboard as the visual brief.</div>
+            )}
+            {selectedIdea?.goal && <p className="cover-context">Goal: {selectedIdea.goal}</p>}
+          </div>
+          <div>
+            <label>Format</label>
+            <div className="option-tiles">
+              {(Object.keys(COVER_FORMATS) as CoverFormat[]).map((option) => {
+                const spec = COVER_FORMATS[option];
+                return <button type="button" className={format === option ? "option-tile active" : "option-tile"} key={option} onClick={() => setFormat(option)}><strong>{spec.label} · {spec.aspectRatio}</strong><span>{spec.safeZone}</span></button>;
+              })}
+            </div>
+          </div>
+          <div>
+            <label>Visual treatment</label>
+            <div className="option-tiles">
+              <button type="button" className={treatment === "faceless" ? "option-tile active" : "option-tile"} onClick={() => setTreatment("faceless")}><strong>Faceless</strong><span>One proof object carries the click.</span></button>
+              <button type="button" className={treatment === "face" ? "option-tile active" : "option-tile"} onClick={() => setTreatment("face")}><strong>With face</strong><span>Use an expression when it adds meaning.</span></button>
+            </div>
+          </div>
+        </div>
+        <div className="panel-foot">
+          <span>One focus · max. four overlay words · high contrast · format safe zone.</span>
+          <button className="primary-button" type="button" onClick={() => selectedIdea && onGenerate({ ideaId: selectedIdea.id, format, treatment })} disabled={blocked}><ImageSquare size={15} /> {covers.phase === "loading" ? "Rendering covers…" : `Create ${formatSpecLabel(format)} packages`}</button>
+        </div>
+        {covers.phase === "error" && <div className="strategy-error"><WarningCircle size={20} weight="fill" /><h3>No cover</h3><p>{covers.error}</p></div>}
+      </section>
+
+      <div className="section-head"><div><p className="kicker">{selectedIdea ? selectedIdea.title : "Cover Lab"} · latest boards</p><h2>Both formats on one Idea</h2></div><p className="note">A new 16:9 run updates the YouTube slot only. The 4:5 Reel slot remains attached to this Idea.</p></div>
+      {selectedIdea ? (
+        <div className="cover-board-columns">
+          <CoverBoardPanel format="reel" board={selectedIdea.coverBoards?.find((board) => board.format === "reel")} running={Boolean(covers.run?.ideaId === selectedIdea.id && covers.run.format === "reel")} onRegenerate={regenerate} />
+          <CoverBoardPanel format="youtube" board={selectedIdea.coverBoards?.find((board) => board.format === "youtube")} running={Boolean(covers.run?.ideaId === selectedIdea.id && covers.run.format === "youtube")} onRegenerate={regenerate} />
+        </div>
+      ) : <div className="empty-state">No developed Idea has a Cover-Lab board yet.</div>}
+    </div>
+  );
+}
+
+function formatSpecLabel(format: CoverFormat) {
+  return format === "reel" ? "Reel 4:5" : "YouTube 16:9";
+}
+
+/**
+ * The Hooks board. Paste a transcript, an idea or one line, ask for 5, 10 or 15
+ * first-three-second variants, and read them grouped by the hypothesis each one
+ * tests. Every run is its own entry in the history rail.
+ */
+function HooksView({
+  hooks,
+  live,
+  bridge,
+  evidence,
+  onGenerate,
+  onRecheckBridge,
+  onSelect,
+  onReload,
+}: {
+  hooks: HooksState;
+  live: boolean;
+  bridge: BridgeHealth;
+  evidence: StrategyEvidenceItem[];
+  onGenerate: (input: { source: string; direction: string; count: number }) => void;
+  onRecheckBridge: () => void;
+  onSelect: (id: string) => void;
+  onReload: () => void;
+}) {
+  const [source, setSource] = useState("");
+  const [direction, setDirection] = useState("");
+  const [count, setCount] = useState<number>(HOOK_COUNTS[1]);
+  const status = bridgeCopy[bridge];
+  const length = source.trim().length;
+  const tooLong = length > HOOK_INPUT_MAX;
+  // tooLong stays clickable on purpose: the refusal names the count, the disabled button would not.
+  const blocked = bridge === "offline" || bridge === "logged-out" || length === 0;
+  // The newest run is the board until one is picked out of the history rail.
+  const shown = hooks.runs.find((run) => run.id === hooks.selected) ?? hooks.runs[0] ?? null;
+  const variants = shown ? shown.groups.reduce((total, group) => total + group.variants.length, 0) : 0;
+
+  return (
+    <div className="view-stack">
+      <section className="hero">
+        <div>
+          <p className="hero-kicker">Hooks board / evidence backed</p>
+          <h1>Hooks</h1>
+          <p className="hero-sub">Paste the transcript, the idea, or the one line you have. The desk writes the first three seconds against the tracked outlier corpus and groups the variants by the hypothesis each one tests.</p>
+        </div>
+        <div className="stat-blocks">
+          <div><strong>{hooks.runs.length}</strong><span>saved runs</span></div>
+          <div><strong>{count}</strong><span>hooks per run</span></div>
+          <div className="lime"><strong>{evidence.length}</strong><span>outlier reels as evidence</span></div>
+        </div>
+      </section>
+
+      <div className="two-col">
+        <section className="panel glow">
+          <div className="panel-head">
+            <div>
+              <p className="kicker">Source material</p>
+              <h2>What is this reel actually about</h2>
+              <p>Longer input produces sharper hooks. A full transcript gives the desk the real proof and the real payoff to write against. Up to {formatNumber(HOOK_INPUT_MAX)} characters.</p>
+            </div>
+            <div className="control-cluster">
+              <div><span>Model</span><select defaultValue="strategy"><option value="strategy">Sol · strategy</option></select></div>
+              <div>
+                <span>Hooks</span>
+                <select value={count} onChange={(event) => setCount(Number(event.target.value))}>
+                  {HOOK_COUNTS.map((option) => (
+                    <option key={option} value={option}>{option}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className={`bridge-status ${status.tone}`}>
+            <span className="dot" aria-hidden="true" />
+            <div>
+              <strong>{status.label}</strong>
+              <p>{status.hint}</p>
+            </div>
+            <button className="ghost-button" type="button" onClick={onRecheckBridge}>
+              <ArrowsClockwise size={13} /> Check again
+            </button>
+          </div>
+
+          <div className="evidence-note">
+            {live ? (
+              <>
+                <strong>{evidence.length} of at most {STRATEGY_EVIDENCE_LIMIT} outlier reels</strong>
+                <span>
+                  from {OUTLIER_THRESHOLD}x outlier up, last {STRATEGY_EVIDENCE_WINDOW_DAYS} days
+                  {evidence.length > 0 && `: ${[...new Set(evidence.map((item) => item.creator))].join(", ")}`}
+                </span>
+              </>
+            ) : (
+              <>
+                <strong>No corpus</strong>
+                <span>The cards show demo fixtures. The hooks run never sees them.</span>
+              </>
+            )}
+          </div>
+
+          <div className="panel-body">
+            <div>
+              <label htmlFor="hook-source">Transcript, idea, or one liner</label>
+              <textarea id="hook-source" style={{ minHeight: 180 }} placeholder="Paste the full transcript here, or write the premise in a sentence." value={source} onChange={(event) => setSource(event.target.value)} />
+              {/* Exact here, not abbreviated: this is the number the refusal counts against. */}
+              <p className={tooLong ? "count over" : "count"}>
+                {length} / {HOOK_INPUT_MAX} characters
+                {tooLong && ` · ${length - HOOK_INPUT_MAX} too many`}
+              </p>
+            </div>
+            <div>
+              <label htmlFor="hook-direction">Direction · optional</label>
+              <textarea id="hook-direction" placeholder="Angle it at agencies. Keep the tool name in the first three words." value={direction} onChange={(event) => setDirection(event.target.value)} />
+            </div>
+          </div>
+          <div className="panel-foot">
+            <span>Uses the local strategy bridge. Nothing is sent to an API key.</span>
+            <button className="primary-button" type="button" onClick={() => onGenerate({ source, direction, count })} disabled={blocked}>
+              Generate hooks <ArrowRight size={15} />
+            </button>
+          </div>
+
+          {hooks.running > 0 && (
+            <div className="strategy-loading">
+              <span /><span /><span />
+              <p>{hooks.running === 1 ? "Writing hooks against the evidence packet" : `${hooks.running} runs against the evidence packet`}</p>
+            </div>
+          )}
+          {hooks.error && (
+            <div className="strategy-error">
+              <WarningCircle size={20} weight="fill" />
+              <h3>No board</h3>
+              <p>{hooks.error}</p>
+            </div>
+          )}
+
+          {shown && (
+            <div className="hook-board">
+              <div className="hook-board-head">
+                <span>{variants} hooks from {shown.evidenceCount} outlier reels</span>
+                <span className="num">{formatStamp(shown.createdAt)}</span>
+              </div>
+              {shown.groups.map((group) => (
+                <section className="hook-group" key={group.hypothesis}>
+                  <header>
+                    <h3>{group.label}</h3>
+                    <p>{group.hint}</p>
+                    <span className="num">{group.variants.length}</span>
+                  </header>
+                  {group.variants.map((variant, index) => (
+                    <article className="hook-row" key={`${group.hypothesis}-${index}`}>
+                      <span className="rank">{String(index + 1).padStart(2, "0")}</span>
+                      <div>
+                        <h4>{variant.hook}</h4>
+                        <p>{variant.rationale}</p>
+                        <ul className="hook-evidence">
+                          {variant.evidence.map((item) => (
+                            <li key={`${item.creator}-${item.hook}`}>
+                              <strong>{formatOutlier(item.outlier)}</strong> {item.creator} · {item.hook}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </article>
+                  ))}
+                </section>
+              ))}
+            </div>
+          )}
+          {!shown && hooks.phase === "ready" && hooks.running === 0 && (
+            <div className="empty-state">No run yet. Paste the source above and generate the first board.</div>
+          )}
+          {hooks.phase === "loading" && <div className="empty-state">Reading the hook runs.</div>}
+          {hooks.phase === "error" && <div className="empty-state">The hookRuns table is unreachable.</div>}
+        </section>
+
+        <aside className="history-rail">
+          <div className="rail-head">
+            <span>History</span>
+            <button className="ghost-button" type="button" onClick={onReload}>
+              <ArrowsClockwise size={12} /> {hooks.runs.length} saved
+            </button>
+          </div>
+          {hooks.runs.length === 0 && <div className="empty-state">Every run lands here.</div>}
+          {hooks.runs.map((run) => (
+            <article key={run.id} className={shown?.id === run.id ? "active" : undefined}>
+              <button type="button" onClick={() => onSelect(run.id)}>
+                <div className="when">
+                  {formatStamp(run.createdAt)} · {run.kind === "transcript" ? "Transcript" : "One liner"}
+                  <strong>{run.requested} hooks</strong>
+                </div>
+                <p>{run.sourceExcerpt}</p>
+              </button>
+              <span className="num">{formatNumber(run.sourceLength)}</span>
+            </article>
+          ))}
+        </aside>
+      </div>
+    </div>
+  );
+}
+
+/** Reach of one owned lane, off the same corpus math the creator detail reads. */
+function laneStats(reels: Ranked[]) {
+  const { retained, views, strongestOutlier } = creatorStats(reels);
+  return {
+    count: retained,
+    averagePlays: retained ? Math.round(views / retained) : 0,
+    bestOutlier: strongestOutlier,
+  };
+}
+
+function ProfileView({ creators, rankedSignals, runs, runsMonth, runsState }: { creators: Creator[]; rankedSignals: Ranked[]; runs: Run[]; runsMonth: MonthUsage | null; runsState: "loading" | "ready" | "error" }) {
+  const owned = creators.filter(isOwned);
+  const ownedIds = new Set(owned.map((c) => c.id));
+  const nowMs = Date.now();
+  // Outlier first: the question this tab answers is which own format last caught fire.
+  const mine = rankedSignals
+    .filter((s) => ownedIds.has(s.creatorId))
+    .sort((a, b) => (b.outlier ?? 0) - (a.outlier ?? 0) || new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
+  const followers = owned.reduce((sum, creator) => sum + creator.audience, 0);
+  const all = laneStats(mine);
+  /** Per lane, so two own accounts never read as one average. */
+  const lanes = owned.map((creator) => ({ creator, ...laneStats(mine.filter((s) => s.creatorId === creator.id)) }));
+  return (
+    <div className="view-stack">
+      <section className="hero">
+        <div>
+          <p className="hero-kicker">Owned performance / separate from research</p>
+          <h1>Profile</h1>
+          <p className="hero-sub">Your own lanes, tracked with the same outlier math as the competitor corpus. Find the last banger, then work out what made it one.</p>
+        </div>
+        <div className="stat-blocks">
+          <div><strong>{formatNumber(followers)}</strong><span>followers</span></div>
+          <div><strong>{all.count}</strong><span>videos tracked</span></div>
+          <div><strong>{all.count ? formatNumber(all.averagePlays) : "—"}</strong><span>average plays</span></div>
+          <div className="lime"><strong>{formatOutlier(all.bestOutlier)}</strong><span>strongest outlier</span></div>
+        </div>
+      </section>
+
+      <section className="profile-head">
+        <span className="profile-mark">SR</span>
+        <div><h2>Your signal room</h2><p>Adapters decide the data source, the ranking method, and the strategy provider.</p></div>
+        <span className="demo-badge">{owned.length ? "Owned lanes connected" : "No owned lane yet"}</span>
+      </section>
+
+      <div className="settings-grid">
+        <div><span>Data source</span><strong>Apify connector</strong></div>
+        <div><span>Ranking method</span><strong>Follower-relative outlier</strong></div>
+        <div><span>Tracked channels</span><strong>{creators.length}</strong></div>
+        <div><span>Strategy bridge</span><strong>Local and optional</strong></div>
+      </div>
+
+      <div className="section-head"><div><p className="kicker">Own accounts</p><h2>Owned lanes</h2></div><p className="note">Followers, average plays and the strongest outlier per own account. Mark a handle as your own under Tracked Channels to add a lane.</p></div>
+      <table className="desk-table">
+        <thead><tr><th>Account</th><th className="right">Followers</th><th className="right">Reels</th><th className="right">Ø plays</th><th className="right">Best outlier</th></tr></thead>
+        <tbody>
+          {lanes.map(({ creator, count, averagePlays, bestOutlier }) => (
+            <tr key={creator.id}>
+              <td>
+                <div className="creator-cell">
+                  <span className="creator-avatar" style={{ background: creator.accent }}>
+                    {creator.avatarUrl ? <img src={creator.avatarUrl} alt="" referrerPolicy="no-referrer" /> : creator.name.slice(0, 2).toUpperCase()}
+                  </span>
+                  <div><strong>{creator.name}</strong><small>{creator.handle}</small></div>
+                </div>
+              </td>
+              <td className="right num">{formatNumber(creator.audience)}</td>
+              <td className="right num">{count}</td>
+              <td className="right num">{count ? formatNumber(averagePlays) : "—"}</td>
+              <td className="right lime">{formatOutlier(bestOutlier)}</td>
+            </tr>
+          ))}
+          {lanes.length === 0 && <tr><td colSpan={5}><div className="empty-state">No own account marked yet.</div></td></tr>}
+        </tbody>
+      </table>
+
+      <div className="section-head"><div><p className="kicker">Own performance</p><h2>Every owned upload, strongest first</h2></div><p className="note">The same follower-relative outlier the competitor corpus is read with, so the last own banger is the top row.</p></div>
+      <table className="desk-table">
+        <thead><tr><th>Video</th><th className="hide-sm">Published</th><th className="right">Plays</th><th className="right">Outlier</th></tr></thead>
+        <tbody>
+          {mine.map((signal) => (
+            <tr key={signal.id}>
+              <td><div className="thumb-cell">{signal.coverUrl ? <img className="mini" src={signal.coverUrl} alt="" /> : <span className="mini" />}<div><strong>{signal.title}</strong><small>{signal.format ?? "video"}</small></div></div></td>
+              <td className="hide-sm muted">{timeAgo(signal.publishedAt, nowMs)}</td>
+              <td className="right num">{formatNumber(signal.plays ?? signal.views)}</td>
+              <td className="right lime">{(signal.outlier ?? 0).toFixed(2)}x</td>
+            </tr>
+          ))}
+          {mine.length === 0 && <tr><td colSpan={4}><div className="empty-state">No owned uploads yet.</div></td></tr>}
+        </tbody>
+      </table>
+
+      <div className="section-head"><div><p className="kicker">Collection log</p><h2>Last runs</h2></div><p className="note">Every refresh is logged: window, counts, Apify cost, and which creators failed. A failing creator keeps its cursor and is retried next run. A refresh touches at most the configured number of creators; the rest keep their cursor and go first next time.</p></div>
+      {runsMonth && (
+        <div className="stat-blocks run-month">
+          <div className="lime" title={runsMonth.truncated ? "Only the newest 100 runs are summed; the month has more." : undefined}><strong>{runsMonth.costUsd === undefined ? "unknown" : `${formatUsd(runsMonth.costUsd)}${runsMonth.truncated ? "+" : ""}`}</strong><span>Apify this month</span></div>
+          <div><strong>{runsMonth.computeUnits === undefined ? "—" : runsMonth.computeUnits.toFixed(2)}</strong><span>compute units</span></div>
+          <div><strong>{runsMonth.runs}</strong><span>runs in {runsMonth.month}</span></div>
+          <div><strong>{runsMonth.unknownRuns}</strong><span>runs without a figure</span></div>
+        </div>
+      )}
+      <table className="desk-table">
+        <thead><tr><th>Started</th><th>Status</th><th className="hide-sm">Duration</th><th className="right">Creators</th><th className="right">New</th><th className="right">Updated</th><th className="right">Transcripts</th><th className="right">Cost</th><th className="hide-sm">Errors</th></tr></thead>
+        <tbody>
+          {runs.slice(0, 10).map((run) => {
+            const cost = formatRunCost(run.usage);
+            const skipped = run.creatorsSkipped ?? 0;
+            const hashtagSweep = run.kind === "hashtag-sweep";
+            return (
+              <tr key={run.id}>
+                <td><strong>{formatStamp(run.startedAt)}</strong><br /><small className="muted">{hashtagSweep ? "Instagram hashtag sweep" : run.kind}{run.transcriptSignalId ? ` · Reel ${run.transcriptSignalId}` : ""}</small></td>
+                <td><span className={`status-chip run-${run.status}`}>{run.status === "ok" ? <CheckCircle size={14} weight="fill" /> : <WarningCircle size={14} weight="fill" />} {run.status}</span></td>
+                <td className="hide-sm muted">{formatDuration(run.durationMs)}</td>
+                <td className="right num" title={skipped ? `${skipped} left for the next run by the creator limit` : undefined}>{hashtagSweep ? `${run.hashtagsChecked ?? 0} tags` : <>{run.creatorsChecked}{skipped ? <small className="muted"> +{skipped} left</small> : null}</>}</td>
+                <td className="right num">{run.recordsAdded}</td>
+                <td className="right num">{run.recordsUpdated}</td>
+                <td className="right num" title={`${run.transcriptSignalId ? `Reel ${run.transcriptSignalId} · ` : ""}Added / Silent / Missing / Failed`}>{formatTranscriptCounts(run)}</td>
+                <td className={cost.label === "unknown" ? "right muted" : "right num"} title={cost.title}>{cost.label}</td>
+                <td className="hide-sm muted">{run.errors.length === 0 ? "—" : run.errors.map((e) => `${e.handle}: ${e.message}`).join(" · ")}</td>
+              </tr>
+            );
+          })}
+          {runsState === "loading" && runs.length === 0 && <tr><td colSpan={9}><div className="empty-state">Loading runs…</div></td></tr>}
+          {runsState === "error" && <tr><td colSpan={9}><div className="empty-state">Run log unavailable. Reload to try again.</div></td></tr>}
+          {runsState === "ready" && runs.length === 0 && <tr><td colSpan={9}><div className="empty-state">No runs yet. Hit refresh to log the first one.</div></td></tr>}
+        </tbody>
+      </table>
+
+      <aside className="explain-note"><WarningCircle size={20} weight="fill" /><div><strong>Bring your own advantage</strong><p>Private prompts, source lists, thresholds, audience theory, and scoring logic belong in your own adapters and private environment.</p></div></aside>
+    </div>
+  );
+}
+
+function AddCreatorDialog({ onClose, onSubmit, state }: { onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void; state: "idle" | "loading" | "error" }) {
+  return (
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="dialog-heading"><div><p>Add to daily watch</p><h2 id="dialog-title">Track a public channel</h2></div><button className="icon-button" onClick={onClose} aria-label="Close"><X size={18} /></button></div>
+        <form onSubmit={onSubmit}>
+          <label><span>Channel handle</span><input name="handle" placeholder="@usefulcreator" autoFocus required /><small>The connector resolves the handle and pulls the last 90 days.</small></label>
+          <label><span>Network</span><select name="network" defaultValue="instagram"><option value="youtube">YouTube</option><option value="instagram">Instagram</option><option value="tiktok">TikTok</option></select></label>
+          <label><span>Market</span><select name="market" defaultValue="de"><option value="de">German (core niche)</option><option value="en">English</option></select><small>English-market creators keep their Format Signals in a separate group and yield transcript budget to the core niche.</small></label>
+          <label className="check-label"><input type="checkbox" name="owned" /><span>This is my own account<small>Owned accounts are read in Profile and stay out of Discover, Briefing and Format Signals.</small></span></label>
+          <div className="dialog-actions"><button type="button" className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" type="submit" disabled={state === "loading"}>{state === "loading" ? "Backfilling 90 days via Apify…" : state === "error" ? "Failed, retry" : "Add to daily watch"}<ArrowRight size={15} /></button></div>
+        </form>
+      </div>
+    </div>
+  );
+}
